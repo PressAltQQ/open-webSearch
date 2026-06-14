@@ -38,6 +38,7 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
     const fetchGithubToolName = getToolName('MCP_TOOL_FETCH_GITHUB_NAME', 'fetchGithubReadme');
     const fetchJuejinToolName = getToolName('MCP_TOOL_FETCH_JUEJIN_NAME', 'fetchJuejinArticle');
     const fetchWebToolName = getToolName('MCP_TOOL_FETCH_WEB_NAME', 'fetchWebContent');
+    const deepResearchToolName = getToolName('MCP_TOOL_DEEPRESEARCH_NAME', 'deepresearch');
 
     // 搜索工具
     // 生成搜索工具的动态描述
@@ -316,6 +317,110 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                     content: [{
                         type: 'text',
                         text: `Failed to fetch article: ${error instanceof Error ? error.message : 'Unknown error'}`
+                    }],
+                    isError: true
+                };
+            }
+        }
+    );
+
+    // Deep research tool — multi-step: search → fetch top results → return combined bundle
+    server.tool(
+        deepResearchToolName,
+        "Perform deep research: searches the web, fetches full content of top results, and returns a structured bundle. Use for comprehensive research where you need full source text, not just snippets.",
+        {
+            query: z.string().min(1, "Research query must not be empty"),
+            maxResults: z.number().int().min(1).max(10).default(5),
+            engines: z.array(getEngineInputSchema()).min(1).default([runtime.config.defaultSearchEngine])
+                .transform(requestedEngines => resolveRequestedEngines(
+                    requestedEngines,
+                    runtime.config.allowedSearchEngines,
+                    runtime.config.defaultSearchEngine
+                ) as [SupportedSearchEngine, ...SupportedSearchEngine[]])
+        },
+        async ({query, maxResults = 5, engines}) => {
+            try {
+                const resolvedEngines = resolveRequestedEngines(
+                    engines ?? [runtime.config.defaultSearchEngine],
+                    runtime.config.allowedSearchEngines,
+                    runtime.config.defaultSearchEngine
+                ) as [SupportedSearchEngine, ...SupportedSearchEngine[]];
+
+                // Step 1: Search
+                console.error(`[deepresearch] Searching for "${query}" using engines: ${resolvedEngines.join(', ')}`);
+                const searchResult = await runtime.services.search.execute({
+                    query,
+                    engines: resolvedEngines,
+                    limit: maxResults,
+                    searchMode: undefined
+                });
+
+                if (!searchResult.results || searchResult.results.length === 0) {
+                    return {
+                        content: [{
+                            type: 'text' as const,
+                            text: JSON.stringify({
+                                query,
+                                totalResults: 0,
+                                results: [],
+                                message: 'No search results found for this query.'
+                            }, null, 2)
+                        }]
+                    };
+                }
+
+                // Step 2: Fetch full content for each result in parallel
+                const fetchPromises = searchResult.results.map(async (result) => {
+                    try {
+                        console.error(`[deepresearch] Fetching: ${result.url}`);
+                        const content = await runtime.services.fetchWeb.execute({
+                            url: result.url,
+                            maxChars: 30000,
+                            readability: true
+                        });
+                        return {
+                            title: result.title,
+                            url: result.url,
+                            description: result.description,
+                            content
+                        };
+                    } catch (fetchError) {
+                        console.error(`[deepresearch] Failed to fetch ${result.url}: ${(fetchError as Error).message}`);
+                        return {
+                            title: result.title,
+                            url: result.url,
+                            description: result.description,
+                            content: null,
+                            fetchError: fetchError instanceof Error ? fetchError.message : 'Unknown error'
+                        };
+                    }
+                });
+
+                const fetchedResults = await Promise.all(fetchPromises);
+                const successfulFetches = fetchedResults.filter(r => r.content !== null).length;
+                console.error(`[deepresearch] Fetched ${successfulFetches}/${fetchedResults.length} sources`);
+
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({
+                            query,
+                            totalResults: fetchedResults.length,
+                            successfulFetches,
+                            results: fetchedResults,
+                            searchMeta: {
+                                engines: searchResult.engines,
+                                partialFailures: searchResult.partialFailures
+                            }
+                        }, null, 2)
+                    }]
+                };
+            } catch (error) {
+                console.error('Deep research tool execution failed:', error);
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: `Deep research failed: ${error instanceof Error ? error.message : 'Unknown error'}`
                     }],
                     isError: true
                 };
