@@ -56,7 +56,8 @@ function testNormalizeEngineName(): void {
         'brave',
         'juejin',
         'startpage',
-        'sogou'
+        'sogou',
+        'searxng'
     ], 'supported engines list');
     console.log('✅ normalizeEngineName and supported engines');
 }
