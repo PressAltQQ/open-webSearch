@@ -72,6 +72,25 @@ async function main(): Promise<void> {
     assert((calls.length as number) === 5, `max 5 pages, got ${calls.length}`);
     console.log('✅ pagination bounds');
 
+    // stops when a page adds no new unique results
+    mockPages(Array.from({ length: 5 }, () => ({ data: { results: [item(1)] } })));
+    results = await searchSearxng('q', 10);
+    assert(results.length === 1 && (calls.length as number) === 2, `stops on all-duplicate page, calls=${calls.length}`);
+    console.log('✅ stops on duplicate-only page');
+
+    // overall deadline across pages
+    config.searxngTimeoutMs = 60;
+    let seenSignal = false;
+    __setSearxngHttpGetForTests(async (_u, options) => {
+        seenSignal = options.signal instanceof AbortSignal && typeof options.timeout === 'number' && options.timeout <= 60;
+        await new Promise((r) => setTimeout(r, 40));
+        return { status: 200, data: { results: [item(Math.random())] } } as any;
+    });
+    await expectReject(() => searchSearxng('q', 50), /overall timeout|request failed/, 'overall deadline');
+    assert(seenSignal, 'abort signal and remaining timeout passed');
+    config.searxngTimeoutMs = 5000;
+    console.log('✅ overall deadline');
+
     // optional params omitted
     config.searxngEngines = []; config.searxngCategories = []; config.searxngLanguage = undefined;
     mockPages([{ data: { results: [item(1)] } }]);

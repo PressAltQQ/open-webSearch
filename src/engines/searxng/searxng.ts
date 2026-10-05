@@ -37,6 +37,8 @@ export async function searchSearxng(query: string, limit: number): Promise<Searc
         ? `searxng:${engines.join(',')}`
         : 'searxng';
 
+    const timeoutMs = config.searxngTimeoutMs ?? 10000;
+    const deadline = Date.now() + timeoutMs;
     const seen = new Set<string>();
     const collected: SearchResult[] = [];
 
@@ -46,12 +48,20 @@ export async function searchSearxng(query: string, limit: number): Promise<Searc
         if (categories.length > 0) params.categories = categories.join(',');
         if (config.searxngLanguage) params.language = config.searxngLanguage;
 
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+            throw new Error(`SearXNG request failed: overall timeout of ${timeoutMs}ms exceeded`);
+        }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), remaining);
+
         let response: AxiosResponse;
         try {
             response = await httpGet(`${baseUrl}/search`, {
                 params,
                 proxy: false,
-                timeout: config.searxngTimeoutMs ?? 10000,
+                timeout: remaining,
+                signal: controller.signal,
                 maxRedirects: 0,
                 headers: { Accept: 'application/json' },
                 // parse JSON ourselves so parse failures give a clear message
@@ -61,6 +71,8 @@ export async function searchSearxng(query: string, limit: number): Promise<Searc
             });
         } catch (error) {
             throw new Error(`SearXNG request failed: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+            clearTimeout(timer);
         }
 
         if (response.status !== 200) {
@@ -84,6 +96,7 @@ export async function searchSearxng(query: string, limit: number): Promise<Searc
             break;
         }
 
+        const before = collected.length;
         for (const raw of rawResults) {
             if (!raw.url || !raw.title || seen.has(raw.url)) continue;
             seen.add(raw.url);
@@ -95,6 +108,9 @@ export async function searchSearxng(query: string, limit: number): Promise<Searc
                 source: upstream ?? '',
                 engine: engineLabel
             });
+        }
+        if (collected.length === before) {
+            break; // page added nothing new
         }
     }
 
