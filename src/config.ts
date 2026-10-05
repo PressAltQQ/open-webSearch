@@ -3,7 +3,7 @@ import ipaddr from 'ipaddr.js';
 
 export interface AppConfig {
     // Search engine configuration
-    defaultSearchEngine: 'bing' | 'duckduckgo' | 'exa' | 'brave' | 'baidu' | 'csdn' | 'linuxdo'  | 'juejin' | 'startpage' | 'sogou';
+    defaultSearchEngine: 'bing' | 'duckduckgo' | 'exa' | 'brave' | 'baidu' | 'csdn' | 'linuxdo'  | 'juejin' | 'startpage' | 'sogou' | 'searxng';
     // List of allowed search engines (if empty, all engines are available)
     allowedSearchEngines: string[];
     // Search mode: request only, auto request then fallback, or force Playwright
@@ -22,11 +22,21 @@ export interface AppConfig {
     playwrightCdpEndpoint?: string;
     playwrightHeadless: boolean;
     playwrightNavigationTimeoutMs: number;
+    // SearXNG configuration (self-hosted JSON API)
+    searxngUrl?: string;
+    searxngEngines?: string[];
+    searxngCategories?: string[];
+    searxngLanguage?: string;
+    searxngTimeoutMs?: number;
     // CORS configuration
     enableCors: boolean;
     corsOrigin: string;
     // Server configuration (determined by MODE env var: 'both', 'http', or 'stdio')
     enableHttpServer: boolean;
+}
+
+function readCsvEnv(name: string): string[] {
+    return (process.env[name] ?? '').split(',').map(v => v.trim()).filter(Boolean);
 }
 
 function readOptionalEnv(name: string): string | undefined {
@@ -57,6 +67,11 @@ export const config: AppConfig = {
     playwrightCdpEndpoint: readOptionalEnv('PLAYWRIGHT_CDP_ENDPOINT'),
     playwrightHeadless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
     playwrightNavigationTimeoutMs: Number(process.env.PLAYWRIGHT_NAVIGATION_TIMEOUT_MS || 20000),
+    searxngUrl: readOptionalEnv('SEARXNG_URL'),
+    searxngEngines: readCsvEnv('SEARXNG_ENGINES'),
+    searxngCategories: readCsvEnv('SEARXNG_CATEGORIES'),
+    searxngLanguage: readOptionalEnv('SEARXNG_LANGUAGE'),
+    searxngTimeoutMs: Number(process.env.SEARXNG_TIMEOUT_MS || 10000),
     // CORS configuration
     enableCors: process.env.ENABLE_CORS === 'true',
     corsOrigin: process.env.CORS_ORIGIN || '*',
@@ -66,7 +81,7 @@ export const config: AppConfig = {
 };
 
 // Valid search engines list
-const validSearchEngines = ['bing', 'duckduckgo', 'exa', 'brave', 'baidu', 'csdn', 'linuxdo', 'juejin', 'startpage', 'sogou'];
+const validSearchEngines = ['bing', 'duckduckgo', 'exa', 'brave', 'baidu', 'csdn', 'linuxdo', 'juejin', 'startpage', 'sogou', 'searxng'];
 const validSearchModes = ['request', 'auto', 'playwright'];
 const validPlaywrightPackages = ['auto', 'playwright', 'playwright-core'];
 const quietStartupLogs = process.env.OPEN_WEBSEARCH_QUIET_STARTUP === 'true';
@@ -112,6 +127,15 @@ if (config.fakeIpCidrs.length > 0) {
 if (!Number.isFinite(config.playwrightNavigationTimeoutMs) || config.playwrightNavigationTimeoutMs <= 0) {
     console.warn(`Invalid PLAYWRIGHT_NAVIGATION_TIMEOUT_MS: "${process.env.PLAYWRIGHT_NAVIGATION_TIMEOUT_MS}", falling back to 20000`);
     config.playwrightNavigationTimeoutMs = 20000;
+}
+
+if (!Number.isFinite(config.searxngTimeoutMs) || (config.searxngTimeoutMs ?? 0) <= 0) {
+    console.warn(`Invalid SEARXNG_TIMEOUT_MS: "${process.env.SEARXNG_TIMEOUT_MS}", falling back to 10000`);
+    config.searxngTimeoutMs = 10000;
+}
+
+if (config.defaultSearchEngine === 'searxng' && !config.searxngUrl) {
+    console.warn('DEFAULT_SEARCH_ENGINE is "searxng" but SEARXNG_URL is not set; searches will fail until it is configured');
 }
 
 if (config.playwrightWsEndpoint && config.playwrightCdpEndpoint) {

@@ -8,6 +8,7 @@ import { searchExa } from '../engines/exa/index.js';
 import { searchBrave } from '../engines/brave/index.js';
 import { searchJuejin } from '../engines/juejin/index.js';
 import { searchStartpage } from '../engines/startpage/index.js';
+import { searchSearxng } from '../engines/searxng/index.js';
 import { searchSogou } from '../engines/sogou/index.js';
 import { fetchLinuxDoArticle } from '../engines/linuxdo/fetchLinuxDoArticle.js';
 import { fetchCsdnArticle } from '../engines/csdn/fetchCsdnArticle.js';
@@ -50,7 +51,8 @@ function createDefaultSearchExecutors(): SearchEngineExecutorMap {
         brave: searchBrave,
         juejin: searchJuejin,
         startpage: searchStartpage,
-        sogou: searchSogou
+        sogou: searchSogou,
+        searxng: searchSearxng
     };
 }
 

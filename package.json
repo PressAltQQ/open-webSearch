@@ -35,6 +35,7 @@
     "test:runtime": "tsc && node build/test/test-runtime.js",
     "test:sogou": "tsc && node build/test/test-sogou.js",
     "test:startpage": "tsc && node build/test/test-startpage.js",
+    "test:searxng": "tsc && node build/test/test-searxng.js",
     "test:http-request-options": "tsc && node build/test/test-http-request-options.js",
     "test:url-safety": "tsc && node build/test/test-url-safety.js",
     "test:redirect-safety": "tsc && node build/test/test-redirect-safety.js",
