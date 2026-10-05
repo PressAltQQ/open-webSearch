@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { searchSearxng, __setSearxngHttpGetForTests } from '../engines/searxng/searxng.js';
+import { searchSearxng, __setSearxngHttpGetForTests, __setSearxngClockForTests, __resetSearxngStateForTests } from '../engines/searxng/searxng.js';
 
 type Call = { url: string; params: Record<string, unknown>; proxy: unknown };
 const calls: Call[] = [];
@@ -31,12 +31,141 @@ async function expectReject(fn: () => Promise<unknown>, pattern: RegExp, label: 
     throw new Error(`${label}: expected rejection`);
 }
 
+function resetRotationConfig(): void {
+    __resetSearxngStateForTests();
+    config.searxngUrl = 'http://127.0.0.1:8888';
+    config.searxngEngines = [];
+    config.searxngCategories = [];
+    config.searxngLanguage = undefined;
+    config.searxngMaxPages = 1;
+    config.searxngMinIntervalMs = 0;
+    config.searxngCacheTtlMs = 0;
+    config.searxngMaxConcurrency = 2;
+    config.searxngTimeoutMs = 5000;
+    config.searxngRotateEngines = ['duckduckgo', 'bing'];
+    config.searxngEgresses = ['deck', 'vlabs', 'madrid'];
+    config.searxngExtraEngines = ['wikipedia'];
+}
+
+async function testRotation(): Promise<void> {
+    resetRotationConfig();
+    mockPages(Array.from({ length: 10 }, (_, i) => ({ data: { results: [item(i)] } })));
+    for (let i = 0; i < 4; i++) await searchSearxng(`q${i}`, 1);
+    const engines = calls.map(c => c.params.engines);
+    assert(engines[0] === 'duckduckgo deck,bing deck,wikipedia', `first: ${engines[0]}`);
+    assert(engines[1] === 'duckduckgo vlabs,bing vlabs,wikipedia', `second: ${engines[1]}`);
+    assert(engines[2] === 'duckduckgo madrid,bing madrid,wikipedia', `third: ${engines[2]}`);
+    assert(engines[3] === 'duckduckgo deck,bing deck,wikipedia', `wraps: ${engines[3]}`);
+    const r = await searchSearxng('label', 1);
+    assert(r[0].engine === 'searxng:duckduckgo,bing,wikipedia', `label: ${r[0].engine}`);
+    console.log('✅ rotation round-robin');
+
+    // retry with next egress for the failed copy only; counters independent
+    resetRotationConfig();
+    mockPages([
+        { data: { results: [], unresponsive_engines: [['duckduckgo deck', 'Suspended: too many requests']] } },
+        { data: { results: [item(1)] } },
+        { data: { results: [item(2)] } }
+    ]);
+    const res = await searchSearxng('retry', 1);
+    assert(res.length === 1 && (calls.length as number) === 2, `retried once, calls=${calls.length}`);
+    assert(calls[1].params.engines === 'duckduckgo vlabs,bing deck,wikipedia', `retry engines: ${calls[1].params.engines}`);
+    await searchSearxng('next', 1);
+    assert(calls[2].params.engines === 'duckduckgo madrid,bing vlabs,wikipedia', `independent counters: ${calls[2].params.engines}`);
+    console.log('✅ rotation retry with next egress');
+
+    // retry exhausted -> explicit error
+    resetRotationConfig();
+    mockPages([
+        { data: { results: [], unresponsive_engines: [['duckduckgo deck', 'x']] } },
+        { data: { results: [], unresponsive_engines: [['duckduckgo vlabs', 'x']] } }
+    ]);
+    await expectReject(() => searchSearxng('q', 1), /back off and retry later/, 'retry exhausted');
+    assert(calls.length === 2, 'only one retry');
+    console.log('✅ rotation retry is bounded');
+}
+
+async function testCache(): Promise<void> {
+    resetRotationConfig();
+    config.searxngCacheTtlMs = 1000;
+    let t = 1_000_000;
+    __setSearxngClockForTests({ now: () => t, sleep: async () => {} });
+    mockPages(Array.from({ length: 10 }, (_, i) => ({ data: { results: [item(i)] } })));
+    await searchSearxng('cached', 1);
+    await searchSearxng('cached', 1);
+    assert(calls.length === 1, `second call served from cache, calls=${calls.length}`);
+    await searchSearxng('other', 1);
+    assert((calls.length as number) === 2, 'different query misses cache');
+    t += 1001;
+    await searchSearxng('cached', 1);
+    assert((calls.length as number) === 3, 'expired entry refetched');
+    // empty results are not cached
+    mockPages([{ data: { results: [] } }, { data: { results: [] } }]);
+    await searchSearxng('empty', 1);
+    await searchSearxng('empty', 1);
+    assert((calls.length as number) === 2, 'empty results not cached');
+    __setSearxngClockForTests();
+    console.log('✅ cache hit, expiry, empty not cached');
+}
+
+async function testConcurrencyAndInterval(): Promise<void> {
+    resetRotationConfig();
+    config.searxngRotateEngines = [];
+    config.searxngMaxConcurrency = 2;
+    let inFlight = 0, maxInFlight = 0;
+    const releases: Array<() => void> = [];
+    __setSearxngHttpGetForTests(async () => {
+        inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise<void>((r) => releases.push(r));
+        inFlight--;
+        return { status: 200, data: { results: [item(Math.random())] } } as any;
+    });
+    const all = [1, 2, 3, 4].map((n) => searchSearxng(`c${n}`, 1));
+    await new Promise((r) => setTimeout(r, 20));
+    assert(inFlight === 2, `only 2 in flight, got ${inFlight}`);
+    while (releases.length) { releases.shift()!(); await new Promise((r) => setTimeout(r, 10)); }
+    await Promise.all(all);
+    assert(maxInFlight === 2, `max in flight ${maxInFlight}`);
+    console.log('✅ concurrency limit');
+
+    // min interval with fake clock
+    resetRotationConfig();
+    config.searxngRotateEngines = [];
+    config.searxngMinIntervalMs = 1000;
+    let now = 0;
+    const sleeps: number[] = [];
+    __setSearxngClockForTests({ now: () => now, sleep: async (ms) => { sleeps.push(ms); now += ms; } });
+    mockPages(Array.from({ length: 5 }, (_, i) => ({ data: { results: [item(i)] } })));
+    await searchSearxng('i1', 1);
+    await searchSearxng('i2', 1);
+    assert(sleeps.length === 1 && sleeps[0] === 1000, `min interval enforced: ${JSON.stringify(sleeps)}`);
+    __setSearxngClockForTests();
+    console.log('✅ min interval');
+}
+
+async function testMaxPages(): Promise<void> {
+    resetRotationConfig();
+    config.searxngRotateEngines = [];
+    mockPages(Array.from({ length: 5 }, (_, i) => ({ data: { results: [item(i)] } })));
+    await searchSearxng('p', 10);
+    assert(calls.length === 1, `default 1 page, got ${calls.length}`);
+    config.searxngMaxPages = 99;
+    mockPages(Array.from({ length: 9 }, (_, i) => ({ data: { results: [item(i + 100)] } })));
+    await searchSearxng('p2', 50);
+    assert((calls.length as number) === 5, `capped at 5 pages, got ${calls.length}`);
+    console.log('✅ max pages');
+}
+
 async function main(): Promise<void> {
     config.searxngUrl = 'http://127.0.0.1:8888/';
     config.searxngEngines = ['duckduckgo', 'brave'];
     config.searxngCategories = ['general'];
     config.searxngLanguage = 'en';
     config.searxngTimeoutMs = 5000;
+    config.searxngMaxPages = 5;
+    config.searxngMinIntervalMs = 0;
+    config.searxngCacheTtlMs = 0; // cache off except in the cache tests
+    config.searxngMaxConcurrency = 2;
 
     // request shape + normalization
     mockPages([{ data: { results: [item(1), item(2)] } }]);
@@ -105,7 +234,7 @@ async function main(): Promise<void> {
     mockPages([{ data: '<html>not json</html>' }]);
     await expectReject(() => searchSearxng('q', 1), /invalid JSON/, 'bad json');
     mockPages([{ data: { results: [], unresponsive_engines: [['google', 'timeout']] } }]);
-    await expectReject(() => searchSearxng('q', 1), /unresponsive engines.*google.*timeout/, 'unresponsive engines');
+    await expectReject(() => searchSearxng('q', 1), /rate-limited\/unresponsive.*google.*timeout.*does NOT mean no information/, 'unresponsive engines');
     __setSearxngHttpGetForTests(async () => { throw new Error('ECONNREFUSED'); });
     await expectReject(() => searchSearxng('q', 1), /request failed: ECONNREFUSED/, 'network error');
     console.log('✅ error handling');
@@ -114,7 +243,13 @@ async function main(): Promise<void> {
     await expectReject(() => searchSearxng('q', 1), /SEARXNG_URL is not set/, 'unset url');
     console.log('✅ unavailable without SEARXNG_URL');
 
+    await testRotation();
+    await testCache();
+    await testConcurrencyAndInterval();
+    await testMaxPages();
+
     __setSearxngHttpGetForTests();
+    __setSearxngClockForTests();
     console.log('\nSearXNG tests passed.');
 }
 
