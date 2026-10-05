@@ -28,6 +28,14 @@ export interface AppConfig {
     searxngCategories?: string[];
     searxngLanguage?: string;
     searxngTimeoutMs?: number;
+    // Egress rotation: one "<engine> <egress>" copy per rotated engine per request
+    searxngRotateEngines?: string[];
+    searxngEgresses?: string[];
+    searxngExtraEngines?: string[];
+    searxngCacheTtlMs?: number;
+    searxngMaxConcurrency?: number;
+    searxngMinIntervalMs?: number;
+    searxngMaxPages?: number;
     // CORS configuration
     enableCors: boolean;
     corsOrigin: string;
@@ -72,6 +80,13 @@ export const config: AppConfig = {
     searxngCategories: readCsvEnv('SEARXNG_CATEGORIES'),
     searxngLanguage: readOptionalEnv('SEARXNG_LANGUAGE'),
     searxngTimeoutMs: Number(process.env.SEARXNG_TIMEOUT_MS || 10000),
+    searxngRotateEngines: readCsvEnv('SEARXNG_ROTATE_ENGINES'),
+    searxngEgresses: readCsvEnv('SEARXNG_EGRESSES'),
+    searxngExtraEngines: readCsvEnv('SEARXNG_EXTRA_ENGINES'),
+    searxngCacheTtlMs: Number(process.env.SEARXNG_CACHE_TTL_MS ?? 86400000),
+    searxngMaxConcurrency: Number(process.env.SEARXNG_MAX_CONCURRENCY ?? 2),
+    searxngMinIntervalMs: Number(process.env.SEARXNG_MIN_INTERVAL_MS ?? 1000),
+    searxngMaxPages: Number(process.env.SEARXNG_MAX_PAGES ?? 1),
     // CORS configuration
     enableCors: process.env.ENABLE_CORS === 'true',
     corsOrigin: process.env.CORS_ORIGIN || '*',
@@ -132,6 +147,24 @@ if (!Number.isFinite(config.playwrightNavigationTimeoutMs) || config.playwrightN
 if (!Number.isFinite(config.searxngTimeoutMs) || (config.searxngTimeoutMs ?? 0) <= 0) {
     console.warn(`Invalid SEARXNG_TIMEOUT_MS: "${process.env.SEARXNG_TIMEOUT_MS}", falling back to 10000`);
     config.searxngTimeoutMs = 10000;
+}
+
+function fixNumber(name: string, key: 'searxngCacheTtlMs' | 'searxngMaxConcurrency' | 'searxngMinIntervalMs' | 'searxngMaxPages', fallback: number, min: number, max = Infinity): void {
+    const value = config[key] as number;
+    if (!Number.isFinite(value) || value < min) {
+        console.warn(`Invalid ${name}: "${process.env[name]}", falling back to ${fallback}`);
+        config[key] = fallback;
+    } else if (value > max) {
+        config[key] = max;
+    }
+}
+fixNumber('SEARXNG_CACHE_TTL_MS', 'searxngCacheTtlMs', 86400000, 0);
+fixNumber('SEARXNG_MAX_CONCURRENCY', 'searxngMaxConcurrency', 2, 1);
+fixNumber('SEARXNG_MIN_INTERVAL_MS', 'searxngMinIntervalMs', 1000, 0);
+fixNumber('SEARXNG_MAX_PAGES', 'searxngMaxPages', 1, 1, 5);
+
+if ((config.searxngRotateEngines?.length ?? 0) > 0 && (config.searxngEgresses?.length ?? 0) === 0) {
+    console.warn('SEARXNG_ROTATE_ENGINES is set but SEARXNG_EGRESSES is empty; rotation is disabled');
 }
 
 if (config.defaultSearchEngine === 'searxng' && !config.searxngUrl) {

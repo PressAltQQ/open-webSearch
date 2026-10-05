@@ -176,6 +176,13 @@ npx cross-env DEFAULT_SEARCH_ENGINE=duckduckgo ENABLE_CORS=true open-websearch
 | `SEARXNG_CATEGORIES` | empty | Comma-separated categories | Passed as `categories=` (e.g. `general`) |
 | `SEARXNG_LANGUAGE` | empty | e.g. `en`, `zh-CN` | Passed as `language=` |
 | `SEARXNG_TIMEOUT_MS` | `10000` | Positive integer | Overall deadline (ms) for one SearXNG search call, shared across all result pages |
+| `SEARXNG_ROTATE_ENGINES` | empty | e.g. `duckduckgo,bing` | Engines that exist on the SearXNG side as per-egress copies named `<engine> <egress>`. Each request picks ONE egress per engine (round-robin, independent counters) and sends `engines=duckduckgo deck,bing vlabs,...`, so a query does not hit every egress IP. If a request returns 0 results and a picked copy is listed in `unresponsive_engines`, it is retried once with the next egress. Requires `SEARXNG_EGRESSES`; replaces `SEARXNG_ENGINES` when active |
+| `SEARXNG_EGRESSES` | empty | e.g. `deck,vlabs,madrid,almaty` | Egress suffixes used for rotation |
+| `SEARXNG_EXTRA_ENGINES` | empty | e.g. `wikipedia` | Engines appended to every rotated request as-is (rotation only) |
+| `SEARXNG_CACHE_TTL_MS` | `86400000` | Integer >= 0 | In-memory cache TTL (LRU, 1000 entries) keyed by query, language, categories, engine set and page; only non-empty results are cached. `0` disables |
+| `SEARXNG_MAX_CONCURRENCY` | `2` | Integer >= 1 | Max simultaneous upstream SearXNG calls; others queue |
+| `SEARXNG_MIN_INTERVAL_MS` | `1000` | Integer >= 0 | Minimum spacing between upstream SearXNG calls |
+| `SEARXNG_MAX_PAGES` | `1` | 1-5 | Max result pages fetched per search |
 | `SEARCH_MODE` | `auto` | `request`, `auto`, `playwright` | Search strategy. Currently only affects Bing: request only, request then Playwright fallback, or force Playwright |
 | `PLAYWRIGHT_PACKAGE` | `auto` | `auto`, `playwright`, `playwright-core` | Which Playwright client package to resolve when browser mode is enabled |
 | `PLAYWRIGHT_MODULE_PATH` | empty | Absolute path or project-relative path | Reuse an existing Playwright client package outside this project |
