@@ -175,7 +175,7 @@ npx cross-env DEFAULT_SEARCH_ENGINE=duckduckgo ENABLE_CORS=true open-websearch
 | `SEARXNG_ENGINES` | empty | Comma-separated SearXNG engine names | Passed as `engines=` (e.g. `duckduckgo,brave`); empty uses the instance defaults |
 | `SEARXNG_CATEGORIES` | empty | Comma-separated categories | Passed as `categories=` (e.g. `general`) |
 | `SEARXNG_LANGUAGE` | empty | e.g. `en`, `zh-CN` | Passed as `language=` |
-| `SEARXNG_TIMEOUT_MS` | `10000` | Positive integer | Per-request timeout for SearXNG |
+| `SEARXNG_TIMEOUT_MS` | `10000` | Positive integer | Overall deadline (ms) for one SearXNG search call, shared across all result pages |
 | `SEARCH_MODE` | `auto` | `request`, `auto`, `playwright` | Search strategy. Currently only affects Bing: request only, request then Playwright fallback, or force Playwright |
 | `PLAYWRIGHT_PACKAGE` | `auto` | `auto`, `playwright`, `playwright-core` | Which Playwright client package to resolve when browser mode is enabled |
 | `PLAYWRIGHT_MODULE_PATH` | empty | Absolute path or project-relative path | Reuse an existing Playwright client package outside this project |
