@@ -77,6 +77,16 @@ async function main() {
     return;
   }
 
+  // Optional SearXNG-compatible loopback endpoint: closes the "curl straight into SearXNG" bypass
+  if (config.searxngCompatListen) {
+    try {
+      const { startSearxngCompatServer } = await import('./adapters/http/searxngCompat.js');
+      await startSearxngCompatServer(config.searxngCompatListen);
+    } catch (error) {
+      console.error('❌ SearXNG compat endpoint not started:', error instanceof Error ? error.message : error);
+    }
+  }
+
   // Enable STDIO mode if MODE is 'both' or 'stdio' or not specified
   if (process.env.MODE === undefined || process.env.MODE === 'both' || process.env.MODE === 'stdio') {
     console.error('🔌 Starting STDIO transport...');
