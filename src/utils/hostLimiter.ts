@@ -31,8 +31,8 @@ export class HostLimiter {
     constructor(private options: () => HostLimiterOptions, private now: () => number = () => Date.now()) {}
 
     /** Run `fn` once a global and a per-host slot are available. Resolves with fn's result. */
-    async run<T>(host: string, fn: (info: { queuedMs: number }) => Promise<T>): Promise<T> {
-        const queuedMs = await this.acquire(host);
+    async run<T>(host: string, fn: (info: { queuedMs: number }) => Promise<T>, opts: { deadlineMs?: number } = {}): Promise<T> {
+        const queuedMs = await this.acquire(host, opts.deadlineMs);
         try {
             return await fn({ queuedMs });
         } finally {
@@ -42,8 +42,10 @@ export class HostLimiter {
         }
     }
 
-    private acquire(host: string): Promise<number> {
+    /** `deadlineMs` (absolute, Date.now()-style) caps the queue wait below the configured timeout. */
+    private acquire(host: string, deadlineMs?: number): Promise<number> {
         const o = this.options();
+        const waitLimit = Math.max(1, Math.min(o.queueTimeoutMs, deadlineMs === undefined ? Infinity : deadlineMs - this.now()));
         return new Promise<number>((resolve, reject) => {
             const waiter: Waiter = {
                 host,
@@ -53,8 +55,8 @@ export class HostLimiter {
                     const idx = this.waiters.indexOf(waiter);
                     if (idx < 0) return;
                     this.waiters.splice(idx, 1);
-                    reject(new FetchQueueTimeoutError(host, o.queueTimeoutMs, idx));
-                }, o.queueTimeoutMs)
+                    reject(new FetchQueueTimeoutError(host, waitLimit, idx));
+                }, waitLimit)
             };
             this.waiters.push(waiter);
             this.pump();

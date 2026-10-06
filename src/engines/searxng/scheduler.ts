@@ -14,8 +14,10 @@ export interface SchedulerOptions {
     globalMaxPerMin: number;
     backoffBaseMs: number;
     backoffMaxMs: number;
-    /** full configured queue timeout; only used for the error text */
+    /** full configured queue timeout */
     queueTimeoutMs: number;
+    /** requests allowed to wait in the queue; more are rejected immediately */
+    maxQueueDepth: number;
 }
 
 export interface AcquireRequest {
@@ -25,6 +27,8 @@ export interface AcquireRequest {
     hasExtras: boolean;
     /** remaining queue-wait budget for this caller */
     timeoutMs: number;
+    /** abort a queued request (e.g. the client went away): it leaves the queue without being served */
+    signal?: AbortSignal;
 }
 
 export interface SkippedEngine {
@@ -47,23 +51,46 @@ export interface BackoffChange {
     until: number;
 }
 
-export class QueueTimeoutError extends Error {
-    readonly retryAfterSec: number;
-    constructor(timeoutMs: number, ahead: number) {
-        const sec = Math.round(timeoutMs / 1000);
-        super(`local-search: queue wait exceeded ${sec}s (${ahead} requests ahead), retry later`);
-        this.name = 'QueueTimeoutError';
-        this.retryAfterSec = Math.max(1, sec);
+const sec = (ms: number) => Math.max(1, Math.ceil(ms / 1000));
+
+/** Base of every "come back later" condition; carries the Retry-After and the time actually spent waiting. */
+export class SchedulerBusyError extends Error {
+    constructor(message: string, readonly retryAfterSec: number, readonly queuedMs: number) {
+        super(message);
+        this.name = 'SchedulerBusyError';
     }
 }
 
-export class AllPairsCoolingError extends Error {
-    readonly retryAfterSec: number;
-    constructor(retryInMs: number) {
-        const sec = Math.max(1, Math.ceil(retryInMs / 1000));
-        super(`local-search: all upstream engine/egress pairs are cooling down after errors (earliest recovery in ${sec}s), retry later`);
+export class QueueTimeoutError extends SchedulerBusyError {
+    constructor(waitedMs: number, ahead: number, etaMs: number, globalMaxPerMin: number) {
+        const where = ahead > 0
+            ? `(${ahead} ahead)`
+            : `waiting on the global rate window (limit ${globalMaxPerMin}/min)`;
+        super(`local-search: queue wait exceeded ${Math.round(waitedMs / 1000)}s ${where}; retry in ~${sec(etaMs)}s, do not retry immediately`, sec(etaMs), waitedMs);
+        this.name = 'QueueTimeoutError';
+    }
+}
+
+export class QueueFullError extends SchedulerBusyError {
+    constructor(depth: number, max: number, etaMs: number) {
+        super(`local-search: queue full (${depth} waiting, max ${max}); retry in ~${sec(etaMs)}s, do not retry immediately`, sec(etaMs), 0);
+        this.name = 'QueueFullError';
+    }
+}
+
+export class AllPairsCoolingError extends SchedulerBusyError {
+    constructor(retryInMs: number, waitedMs: number) {
+        super(`local-search: all upstream engine/egress pairs are cooling down after errors (earliest recovery in ${sec(retryInMs)}s); retry in ~${sec(retryInMs)}s, do not retry immediately`, sec(retryInMs), waitedMs);
         this.name = 'AllPairsCoolingError';
-        this.retryAfterSec = sec;
+    }
+}
+
+export class QueueAbortedError extends Error {
+    readonly queuedMs: number;
+    constructor(queuedMs: number) {
+        super('local-search: request aborted while queued');
+        this.name = 'QueueAbortedError';
+        this.queuedMs = queuedMs;
     }
 }
 
@@ -89,6 +116,10 @@ export class SearxngScheduler {
     private wake: (() => void) | null = null;
 
     constructor(private options: () => SchedulerOptions, private clock: () => Clock) {}
+
+    get queueLength(): number {
+        return this.queue.length;
+    }
 
     reset(): void {
         this.pairs.clear();
@@ -134,6 +165,29 @@ export class SearxngScheduler {
         const cooldown = Math.min(o.backoffMaxMs, o.backoffBaseMs * 2 ** (s.failures - 1));
         s.cooldownUntil = this.clock().now() + cooldown;
         return { pair: key, level: s.failures, until: s.cooldownUntil };
+    }
+
+    /** Time until the earliest cooling pair of these engines recovers (0 if none is cooling). */
+    earliestRecoveryMs(engines: string[], egresses: string[]): number {
+        const now = this.clock().now();
+        let earliest = Infinity;
+        for (const engine of engines) {
+            for (const egress of egresses) {
+                const until = this.pairs.get(this.pairKey(engine, egress))?.cooldownUntil ?? 0;
+                if (until > now) earliest = Math.min(earliest, until - now);
+            }
+        }
+        return earliest === Infinity ? 0 : earliest;
+    }
+
+    /** Rough time until a request enqueued now, with `ahead` requests in front, could start. */
+    private etaMs(ahead: number): number {
+        const o = this.options();
+        const max = Math.max(1, o.globalMaxPerMin);
+        const now = this.clock().now();
+        const windowFull = this.window.filter((t) => t > now - WINDOW_MS);
+        const windowWait = windowFull.length >= max ? windowFull[0] + WINDOW_MS - now : 0;
+        return ((ahead + 1) * WINDOW_MS) / max + windowWait;
     }
 
     private notify(): void {
@@ -185,6 +239,18 @@ export class SearxngScheduler {
         const enqueuedAt = clock.now();
         const deadline = enqueuedAt + req.timeoutMs;
         const queueDepth = this.queue.length;
+        const o = this.options();
+        if (queueDepth >= Math.max(1, o.maxQueueDepth)) {
+            throw new QueueFullError(queueDepth, o.maxQueueDepth, this.etaMs(queueDepth));
+        }
+        const waited = () => clock.now() - enqueuedAt;
+        const signal = req.signal;
+        if (signal?.aborted) throw new QueueAbortedError(0);
+        // rejected on abort; the no-op catch keeps it from surfacing as an unhandled rejection when nobody is racing
+        const aborted = new Promise<never>((_, reject) => {
+            signal?.addEventListener('abort', () => reject(new QueueAbortedError(waited())), { once: true });
+        });
+        aborted.catch(() => undefined);
 
         let resolveTurn!: () => void;
         const ticket: Ticket = { turn: new Promise<void>((r) => { resolveTurn = r; }), resolveTurn };
@@ -196,13 +262,17 @@ export class SearxngScheduler {
             if (idx >= 0) this.queue.splice(idx, 1);
             if (idx === 0 && this.queue.length > 0) this.queue[0].resolveTurn();
         };
-        const timeout = () => new QueueTimeoutError(this.options().queueTimeoutMs, Math.max(0, this.queue.indexOf(ticket)));
+        const timeout = () => {
+            const ahead = Math.max(0, this.queue.indexOf(ticket));
+            return new QueueTimeoutError(waited(), ahead, this.etaMs(ahead), this.options().globalMaxPerMin);
+        };
 
         try {
             // 1. wait for our turn (strict FIFO)
             if (this.queue[0] !== ticket) {
                 const turnTimer = new AbortController();
                 const turnResult = await Promise.race([
+                    aborted,
                     ticket.turn.then(() => 'turn' as const),
                     clock.sleep(Math.max(0, deadline - clock.now()), turnTimer.signal).then(() => 'timeout' as const)
                 ]);
@@ -215,7 +285,7 @@ export class SearxngScheduler {
                 const now = clock.now();
                 const plan = this.plan(req, now);
                 if (plan.kind === 'cooling') {
-                    if (plan.retryAt > deadline) throw new AllPairsCoolingError(plan.retryAt - now);
+                    if (plan.retryAt > deadline) throw new AllPairsCoolingError(plan.retryAt - now, waited());
                 } else if (plan.kind === 'ready') {
                     this.window.push(now);
                     this.lastStart = now;
@@ -244,11 +314,15 @@ export class SearxngScheduler {
                 const waitMs = plan.kind === 'cooling' ? plan.retryAt - now : plan.waitMs;
                 const sleeper = new AbortController();
                 const woken = new Promise<void>((r) => { this.wake = r; });
-                await Promise.race([
-                    clock.sleep(Math.min(remaining, waitMs > 0 ? waitMs : remaining), sleeper.signal),
-                    woken
-                ]);
-                sleeper.abort();
+                try {
+                    await Promise.race([
+                        clock.sleep(Math.min(remaining, waitMs > 0 ? waitMs : remaining), sleeper.signal),
+                        woken,
+                        aborted
+                    ]);
+                } finally {
+                    sleeper.abort();
+                }
             }
         } catch (error) {
             leave();

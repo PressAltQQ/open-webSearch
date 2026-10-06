@@ -52,12 +52,15 @@ export function createWebFetchService(fetcher: WebFetcher, limiter: HostLimiter 
             url,
             maxChars,
             readability,
-            includeLinks
+            includeLinks,
+            deadlineMs
         }: {
             url: string;
             maxChars: number;
             readability?: boolean;
             includeLinks?: boolean;
+            /** absolute time (Date.now()-style) after which waiting in the fetch queue is pointless */
+            deadlineMs?: number;
         }): Promise<FetchWebContentResult> {
             if (!validatePublicWebUrl(url)) {
                 throw new Error('Invalid public HTTP(S) URL');
@@ -67,7 +70,7 @@ export function createWebFetchService(fetcher: WebFetcher, limiter: HostLimiter 
             return limiter.run(host, ({ queuedMs }) => {
                 console.error(`[local-search] fetch ${JSON.stringify({ host, queued_ms: queuedMs })}`);
                 return fetcher(url, maxChars, { readability, includeLinks });
-            });
+            }, { deadlineMs });
         }
     };
 }

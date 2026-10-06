@@ -6,6 +6,8 @@ export type SearchExecutionFailure = {
     engine: string;
     code: 'engine_error' | 'unsupported_engine' | 'engine_degraded';
     message: string;
+    /** set for "come back later" conditions (queue timeout, queue full, cooling): seconds to wait */
+    retryAfterSec?: number;
 };
 
 export type SearchExecutionContext = {
@@ -74,7 +76,10 @@ export function createSearchService(engineMap: SearchEngineExecutorMap) {
                     partialFailures.push({
                         engine,
                         code: 'engine_error',
-                        message: error instanceof Error ? error.message : String(error)
+                        message: error instanceof Error ? error.message : String(error),
+                        ...(typeof (error as { retryAfterSec?: unknown })?.retryAfterSec === 'number'
+                            ? { retryAfterSec: (error as { retryAfterSec: number }).retryAfterSec }
+                            : {})
                     });
                     return [];
                 }

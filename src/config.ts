@@ -42,6 +42,7 @@ export interface AppConfig {
     searxngBackoffBaseMs?: number;
     searxngBackoffMaxMs?: number;
     searxngPartialCacheTtlMs?: number;
+    searxngMaxQueueDepth?: number;
     searxngCompatListen?: string;
     // Web fetch limiter (fetchWebContent / deepresearch)
     fetchPerHostConcurrency?: number;
@@ -105,6 +106,7 @@ export const config: AppConfig = {
     searxngBackoffBaseMs: Number(process.env.SEARXNG_BACKOFF_BASE_MS ?? 60000),
     searxngBackoffMaxMs: Number(process.env.SEARXNG_BACKOFF_MAX_MS ?? 3600000),
     searxngPartialCacheTtlMs: Number(process.env.SEARXNG_PARTIAL_CACHE_TTL_MS ?? 600000),
+    searxngMaxQueueDepth: Number(process.env.SEARXNG_MAX_QUEUE_DEPTH ?? 30),
     searxngCompatListen: readOptionalEnv('SEARXNG_COMPAT_LISTEN'),
     fetchPerHostConcurrency: Number(process.env.FETCH_PER_HOST_CONCURRENCY ?? 2),
     fetchPerHostMinIntervalMs: Number(process.env.FETCH_PER_HOST_MIN_INTERVAL_MS ?? 1000),
@@ -175,7 +177,7 @@ if (!Number.isFinite(config.searxngTimeoutMs) || (config.searxngTimeoutMs ?? 0) 
 type NumericConfigKey =
     | 'searxngCacheTtlMs' | 'searxngMaxConcurrency' | 'searxngMinIntervalMs' | 'searxngMaxPages'
     | 'searxngPairMinIntervalMs' | 'searxngGlobalMaxPerMin' | 'searxngQueueTimeoutMs'
-    | 'searxngBackoffBaseMs' | 'searxngBackoffMaxMs' | 'searxngPartialCacheTtlMs'
+    | 'searxngBackoffBaseMs' | 'searxngBackoffMaxMs' | 'searxngPartialCacheTtlMs' | 'searxngMaxQueueDepth'
     | 'fetchPerHostConcurrency' | 'fetchPerHostMinIntervalMs' | 'fetchMaxConcurrency' | 'fetchQueueTimeoutMs';
 
 function fixNumber(name: string, key: NumericConfigKey, fallback: number, min: number, max = Infinity): void {
@@ -197,6 +199,7 @@ fixNumber('SEARXNG_QUEUE_TIMEOUT_MS', 'searxngQueueTimeoutMs', 45000, 1);
 fixNumber('SEARXNG_BACKOFF_BASE_MS', 'searxngBackoffBaseMs', 60000, 1);
 fixNumber('SEARXNG_BACKOFF_MAX_MS', 'searxngBackoffMaxMs', 3600000, 1);
 fixNumber('SEARXNG_PARTIAL_CACHE_TTL_MS', 'searxngPartialCacheTtlMs', 600000, 0);
+fixNumber('SEARXNG_MAX_QUEUE_DEPTH', 'searxngMaxQueueDepth', 30, 1);
 fixNumber('FETCH_PER_HOST_CONCURRENCY', 'fetchPerHostConcurrency', 2, 1);
 fixNumber('FETCH_PER_HOST_MIN_INTERVAL_MS', 'fetchPerHostMinIntervalMs', 1000, 0);
 fixNumber('FETCH_MAX_CONCURRENCY', 'fetchMaxConcurrency', 4, 1);

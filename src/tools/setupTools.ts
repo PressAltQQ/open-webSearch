@@ -116,6 +116,16 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                     console.error(`Search failed for engine ${failure.engine}:`, failure.message);
                 }
 
+                // Queue timeout / queue full / all pairs cooling: nothing was searched, tell the agent plainly
+                // (isError) instead of returning an empty result that looks like "no information exists".
+                const busy = searchResult.partialFailures.filter((f) => f.retryAfterSec !== undefined);
+                if (searchResult.totalResults === 0 && busy.length > 0 && busy.length === searchResult.partialFailures.length) {
+                    return {
+                        content: [{ type: 'text', text: busy.map((f) => f.message).join('\n') }],
+                        isError: true
+                    };
+                }
+
                 return {
                     content: [{
                         type: 'text',
@@ -357,6 +367,13 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                 });
 
                 if (!searchResult.results || searchResult.results.length === 0) {
+                    const busy = searchResult.partialFailures.filter((f) => f.retryAfterSec !== undefined);
+                    if (busy.length > 0 && busy.length === searchResult.partialFailures.length) {
+                        return {
+                            content: [{ type: 'text' as const, text: busy.map((f) => f.message).join('\n') }],
+                            isError: true
+                        };
+                    }
                     return {
                         content: [{
                             type: 'text' as const,
@@ -370,14 +387,17 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                     };
                 }
 
-                // Step 2: Fetch full content for each result in parallel
+                // Step 2: Fetch full content for each result in parallel. All fetches share one queue deadline
+                // (the remaining budget), so the fan-out cannot wait longer than FETCH_QUEUE_TIMEOUT_MS in total.
+                const fetchDeadlineMs = Date.now() + (runtime.config.fetchQueueTimeoutMs ?? 30000);
                 const fetchPromises = searchResult.results.map(async (result) => {
                     try {
                         console.error(`[deepresearch] Fetching: ${result.url}`);
                         const content = await runtime.services.fetchWeb.execute({
                             url: result.url,
                             maxChars: 30000,
-                            readability: true
+                            readability: true,
+                            deadlineMs: fetchDeadlineMs
                         });
                         return {
                             title: result.title,
@@ -411,7 +431,8 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                             results: fetchedResults,
                             searchMeta: {
                                 engines: searchResult.engines,
-                                partialFailures: searchResult.partialFailures
+                                partialFailures: searchResult.partialFailures,
+                                ...(searchResult.meta ? { meta: searchResult.meta } : {})
                             }
                         }, null, 2)
                     }]

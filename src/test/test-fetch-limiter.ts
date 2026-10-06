@@ -60,6 +60,19 @@ async function testQueueTimeout(): Promise<void> {
     console.log('✅ fetch limiter: queue timeout');
 }
 
+async function testSharedDeadline(): Promise<void> {
+    // deepresearch passes one shared deadline: queue waits never exceed the remaining budget
+    const limiter = new HostLimiter(opts({ perHostConcurrency: 1, queueTimeoutMs: 5000 }));
+    const slow = limiter.run('d.example', () => sleep(300));
+    const started = Date.now();
+    let error: unknown;
+    try { await limiter.run('d.example', async () => 'never', { deadlineMs: Date.now() + 60 }); } catch (e) { error = e; }
+    assert(error instanceof FetchQueueTimeoutError, 'deadline ends the queue wait');
+    assert(Date.now() - started < 250, `waited about the deadline, not the 5s queue timeout: ${Date.now() - started}ms`);
+    await slow;
+    console.log('✅ fetch limiter: shared deadline caps the queue wait');
+}
+
 async function testServiceUsesLimiter(): Promise<void> {
     const limiter = new HostLimiter(opts({ perHostConcurrency: 1 }));
     let inFlight = 0, maxInFlight = 0;
@@ -81,6 +94,7 @@ async function main(): Promise<void> {
     await testGlobalConcurrencyAcrossHosts();
     await testPerHostInterval();
     await testQueueTimeout();
+    await testSharedDeadline();
     await testServiceUsesLimiter();
     console.log('\nFetch limiter tests passed.');
 }

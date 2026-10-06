@@ -1,8 +1,10 @@
 import { config } from '../config.js';
-import { SearxngScheduler, QueueTimeoutError, AllPairsCoolingError } from '../engines/searxng/scheduler.js';
+import { SearxngScheduler, QueueTimeoutError, QueueFullError, QueueAbortedError, AllPairsCoolingError } from '../engines/searxng/scheduler.js';
 import type { Clock, SchedulerOptions, Grant } from '../engines/searxng/scheduler.js';
+import { createSearchService } from '../core/search/searchService.js';
 import {
     searchSearxng,
+    SchedulerBusyError,
     searchSearxngDetailed,
     __setSearxngHttpGetForTests,
     __setSearxngClockForTests,
@@ -55,7 +57,8 @@ const baseOptions: SchedulerOptions = {
     globalMaxPerMin: 1000,
     backoffBaseMs: 60_000,
     backoffMaxMs: 3_600_000,
-    queueTimeoutMs: 45_000
+    queueTimeoutMs: 45_000,
+    maxQueueDepth: 30
 };
 
 function makeScheduler(clock: FakeClock, overrides: Partial<SchedulerOptions> = {}): SearxngScheduler {
@@ -136,14 +139,48 @@ async function testQueueTimeout(): Promise<void> {
     const behind = s.acquire(req({ timeoutMs: 10_000 }));
     const [w, b] = await clock.run([waiting, behind]);
     assert(b.status === 'rejected' && b.reason instanceof QueueTimeoutError, 'request behind times out first');
-    assert(/queue wait exceeded 45s \(1 requests ahead\), retry later/.test((b as PromiseRejectedResult).reason.message), `text: ${(b as PromiseRejectedResult).reason.message}`);
-    assert(w.status === 'rejected' && /queue wait exceeded 45s \(0 requests ahead\), retry later/.test((w as PromiseRejectedResult).reason.message), 'head of queue times out too');
-    assert(((w as PromiseRejectedResult).reason as QueueTimeoutError).retryAfterSec === 45, 'retryAfterSec');
+    // the text reports the time actually waited (10s here, not the configured 45s), an ETA and a do-not-retry hint
+    assert(/queue wait exceeded 10s \(1 ahead\); retry in ~\d+s, do not retry immediately/.test((b as PromiseRejectedResult).reason.message), `text: ${(b as PromiseRejectedResult).reason.message}`);
+    // nobody ahead: no contradictory "(0 requests ahead)", it says it waited on the global rate window
+    const headMsg = (w as PromiseRejectedResult).reason.message as string;
+    assert(w.status === 'rejected' && /queue wait exceeded 45s waiting on the global rate window \(limit 1000\/min\); retry in ~\d+s, do not retry immediately/.test(headMsg) && !/0 ahead|0 requests/.test(headMsg), `head text: ${headMsg}`);
+    assert(((w as PromiseRejectedResult).reason as QueueTimeoutError).retryAfterSec >= 1 && ((w as PromiseRejectedResult).reason as QueueTimeoutError).queuedMs === 45_000, 'retryAfterSec and queuedMs (actual wait) on the error');
     holder.release();
     // a timed-out waiter must not poison the queue
     const g = await s.acquire(req());
     g.release();
     console.log('✅ scheduler: queue timeout error text, queue stays healthy');
+}
+
+async function testEtaQueueDepthAndAbort(): Promise<void> {
+    // ETA follows the global rate: (ahead+1) * 60000 / max-per-minute
+    let clock = new FakeClock();
+    let s = makeScheduler(clock, { maxConcurrency: 1, pairMinIntervalMs: 0, globalMaxPerMin: 12, maxQueueDepth: 2 });
+    const holder = await s.acquire(req());
+    const q1 = s.acquire(req({ timeoutMs: 600_000 }));
+    const q2 = s.acquire(req({ timeoutMs: 600_000 }));
+    let full: unknown;
+    try { await s.acquire(req()); } catch (e) { full = e; }
+    assert(full instanceof QueueFullError && /queue full \(2 waiting, max 2\); retry in ~15s, do not retry immediately/.test(full.message) && full.retryAfterSec === 15, `queue full: ${(full as Error)?.message}`);
+    // a queued request can be aborted (client disconnected): it leaves, the others are still served
+    const ac = new AbortController();
+    clock = new FakeClock();
+    s = makeScheduler(clock, { maxConcurrency: 1, pairMinIntervalMs: 0 });
+    const h2 = await s.acquire(req());
+    const aborted = s.acquire(req({ timeoutMs: 600_000, signal: ac.signal }));
+    const after = s.acquire(req({ timeoutMs: 600_000 }));
+    await new Promise((r) => setImmediate(r));
+    ac.abort();
+    let abortError: unknown;
+    try { await aborted; } catch (e) { abortError = e; }
+    assert(abortError instanceof QueueAbortedError, 'aborted waiter rejects with QueueAbortedError');
+    h2.release();
+    const [served] = await clock.run([after]);
+    assert(served.status === 'fulfilled', 'request behind the aborted one is served');
+    (served as PromiseFulfilledResult<Grant>).value.release();
+    holder.release();
+    void q1; void q2;
+    console.log('✅ scheduler: ETA, max queue depth, abort frees the queue ticket');
 }
 
 async function testBackoff(): Promise<void> {
@@ -202,6 +239,7 @@ function resetConfig(): void {
         searxngPairMinIntervalMs: 10_000,
         searxngGlobalMaxPerMin: 1000,
         searxngQueueTimeoutMs: 45_000,
+        searxngMaxQueueDepth: 30,
         searxngBackoffBaseMs: 60_000,
         searxngBackoffMaxMs: 3_600_000,
         searxngPartialCacheTtlMs: 600_000
@@ -252,12 +290,24 @@ async function testBackoffThroughSearch(): Promise<void> {
     // zero contribution while the request had results -> sick
     resetConfig();
     config.searxngRotateEngines = ['duckduckgo', 'bing'];
-    mockUpstream(clock, () => ({ results: [rec('duckduckgo a')] }));
+    mockUpstream(clock, () => ({ results: Array.from({ length: 5 }, () => rec('duckduckgo a')) }));
     await clock.run([searchSearxngDetailed('q4', 5)]);
     const sch = __getSearxngSchedulerForTests();
     assert(sch.pairState('bing', 'a')!.failures === 1 && sch.pairState('duckduckgo', 'a')!.failures === 0, 'zero-contribution engine is sick, contributing one is not');
+    // ... but not with a small sample (< 5 results) and not beyond page 1
+    resetConfig();
+    config.searxngRotateEngines = ['duckduckgo', 'bing'];
+    mockUpstream(clock, () => ({ results: [rec('duckduckgo a'), rec('duckduckgo a')] }));
+    await clock.run([searchSearxngDetailed('q4b', 5)]);
+    assert((__getSearxngSchedulerForTests().pairState('bing', 'a')?.failures ?? 0) === 0, 'small sample: no zero-contribution verdict');
+    mockUpstream(clock, () => ({ results: Array.from({ length: 6 }, () => rec('duckduckgo a')) }));
+    await clock.run([searchSearxngDetailed('q4c', 5, { pageno: 2 })]);
+    assert((__getSearxngSchedulerForTests().pairState('bing', 'a')?.failures ?? 0) === 0, 'only page 1 is judged');
+    resetConfig();
+    config.searxngRotateEngines = ['duckduckgo', 'bing'];
+    mockUpstream(clock, () => ({ results: Array.from({ length: 5 }, () => rec('duckduckgo a')) }));
+    await clock.run([searchSearxngDetailed('q4', 5)]);
     // success resets
-    mockUpstream(clock, () => ({ results: [rec('duckduckgo b'), rec('bing b')] }));
     sch.reportSuccess('bing', 'a');
     assert(sch.pairState('bing', 'a')!.failures === 0, 'success resets');
 
@@ -281,7 +331,7 @@ async function testBackoffThroughSearch(): Promise<void> {
     s3.reportFailure('duckduckgo', 'b');
     const calls3 = mockUpstream(clock, () => ({ results: [] }));
     const [r6] = await clock.run([searchSearxngDetailed('q6', 5)]);
-    assert(r6.status === 'rejected' && /cooling down.*retry later/.test((r6 as PromiseRejectedResult).reason.message) && calls3.length === 0, 'readable error without upstream call');
+    assert(r6.status === 'rejected' && /cooling down.*do not retry immediately/.test((r6 as PromiseRejectedResult).reason.message) && calls3.length === 0, 'readable error without upstream call');
     __setSearxngClockForTests();
     console.log('✅ search: backoff, retry on other pair via scheduler, degraded request, readable error');
 }
@@ -346,12 +396,127 @@ async function testCacheBypassesScheduler(): Promise<void> {
     console.log('✅ search: cache hit bypasses scheduler, partial responses use short TTL');
 }
 
+function captureLogs<T>(fn: () => Promise<T>): Promise<{ lines: string[]; result: PromiseSettledResult<T> }> {
+    const original = console.error;
+    const lines: string[] = [];
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    return fn().then(
+        (value) => ({ lines, result: { status: 'fulfilled' as const, value } }),
+        (reason) => ({ lines, result: { status: 'rejected' as const, reason } })
+    ).finally(() => { console.error = original; });
+}
+const jsonOf = (lines: string[], prefix: string) => lines.filter((l) => l.startsWith(prefix)).map((l) => JSON.parse(l.slice(prefix.length)));
+
+async function testObservability(): Promise<void> {
+    resetConfig();
+    config.searxngRotateEngines = ['duckduckgo', 'bing'];
+    config.searxngExtraEngines = ['wikipedia'];
+    const clock = new FakeClock();
+    __setSearxngClockForTests(clock);
+    // A: one line per upstream call at grant time (pairs, attempt, pageno) + summary with calls and skipped
+    mockUpstream(clock, (engines) => engines.startsWith('duckduckgo a')
+        ? { results: [], unresponsive: [['duckduckgo a', 'CAPTCHA']] }
+        : { results: Array.from({ length: 5 }, () => rec('duckduckgo b')).concat(Array.from({ length: 5 }, () => rec('bing a'))) });
+    __getSearxngSchedulerForTests().reportFailure('bing', 'b');
+    const logged = await captureLogs(async () => (await clock.run([searchSearxngDetailed('observed', 5)]))[0]);
+    const ups = jsonOf(logged.lines, '[local-search] upstream ');
+    assert(ups.length === 2 && ups[0].attempt === 'first' && ups[1].attempt === 'retry', `two upstream lines: ${JSON.stringify(ups)}`);
+    assert(JSON.stringify(ups[0].pairs) === '["duckduckgo:a","bing:a"]' && ups[0].pageno === 1 && typeof ups[0].started_at === 'string' && 'queued_ms' in ups[0] && 'queue_depth' in ups[0], `first line: ${JSON.stringify(ups[0])}`);
+    assert(Date.parse(ups[1].started_at) - Date.parse(ups[0].started_at) >= 0 && JSON.stringify(ups[1].pairs) === '["duckduckgo:b"]', 'retry on the other pair');
+    const summary = jsonOf(logged.lines, '[local-search] search ')[0];
+    assert(summary.calls === 2 && Array.isArray(summary.skipped), `summary: ${JSON.stringify(summary)}`);
+
+    // C/L: a cooling engine is skipped, listed in the log and in partialFailures; a cached partial response
+    // gives the partial state back on a hit
+    resetConfig();
+    config.searxngCacheTtlMs = 3_600_000;
+    config.searxngPairMinIntervalMs = 0;
+    config.searxngExtraEngines = ['wikipedia'];
+    config.searxngRotateEngines = ['duckduckgo', 'bing'];
+    __getSearxngSchedulerForTests().reportFailure('bing', 'a');
+    __getSearxngSchedulerForTests().reportFailure('bing', 'b');
+    mockUpstream(clock, (engines) => ({ results: [rec(engines)], unresponsive: [['wikipedia', 'timeout']] }));
+    const first = await captureLogs(async () => (await clock.run([searchSearxngDetailed('partial-state', 5)]))[0]);
+    assert(jsonOf(first.lines, '[local-search] search ')[0].skipped.join() === 'bing', 'skipped engine in the summary line');
+    const hitCalls = mockUpstream(clock, () => ({ results: [] }));
+    const [hit] = await clock.run([searchSearxngDetailed('partial-state', 5)]);
+    const hv = (hit as PromiseFulfilledResult<Awaited<ReturnType<typeof searchSearxngDetailed>>>).value;
+    assert(hitCalls.length === 0 && hv.meta.cache === 'hit', 'served from cache');
+    assert(hv.partialFailures.some((f) => f.engine === 'bing') && hv.meta.unresponsive.includes('wikipedia') && hv.skipped.join() === 'bing', `partial state restored on hit: ${JSON.stringify(hv.partialFailures)} ${hv.meta.unresponsive}`);
+
+    // B: queued_ms reflects the real wait also when the wait ends in an error
+    resetConfig();
+    config.searxngRotateEngines = [];
+    config.searxngGlobalMaxPerMin = 1;
+    config.searxngQueueTimeoutMs = 5000;
+    mockUpstream(clock, () => ({ results: [rec('x')] }));
+    await clock.run([searchSearxngDetailed('b1', 5)]);
+    const timedOut = await captureLogs(async () => (await clock.run([searchSearxngDetailed('b2', 5)]))[0]);
+    const fail = jsonOf(timedOut.lines, '[local-search] search ')[0];
+    assert(fail.queued_ms === 5000 && /queue wait exceeded 5s/.test(fail.error), `queued_ms on error: ${JSON.stringify(fail)}`);
+    __setSearxngClockForTests();
+    console.log('✅ search: per-call upstream log, skipped engines, cached partial state, queued_ms on errors');
+}
+
+async function testForwardingAndPages(): Promise<void> {
+    const clock = new FakeClock();
+    __setSearxngClockForTests(clock);
+    // D: other categories / client engines are forwarded as-is, no rotation, no pairs; time_range/safesearch pass through
+    resetConfig();
+    config.searxngCacheTtlMs = 3_600_000;
+    config.searxngRotateEngines = ['duckduckgo'];
+    const seen: Array<Record<string, unknown>> = [];
+    __setSearxngHttpGetForTests(async (_u, options) => {
+        seen.push(options.params as Record<string, unknown>);
+        return { status: 200, data: { results: [rec('whatever')] } } as any;
+    });
+    await clock.run([searchSearxngDetailed('pics', 5, { categories: ['images'] })]);
+    assert(seen[0].categories === 'images' && !('engines' in seen[0]), `images forwarded without rotation: ${JSON.stringify(seen[0])}`);
+    await clock.run([searchSearxngDetailed('pics', 5, { engines: ['brave', 'qwant'], timeRange: 'week', safesearch: '1' })]);
+    assert(seen[1].engines === 'brave,qwant' && seen[1].time_range === 'week' && seen[1].safesearch === '1', `client engines/time_range/safesearch: ${JSON.stringify(seen[1])}`);
+    assert(__getSearxngSchedulerForTests().pairState('duckduckgo', 'a') === undefined, 'no pair touched in forwarded mode');
+    // general web search is rotated as before, and time_range is part of the cache key
+    await clock.run([searchSearxngDetailed('web', 5, { categories: ['general'], timeRange: 'day' })]);
+    assert(seen[2].engines === 'duckduckgo a', `general is rotated: ${seen[2].engines}`);
+    await clock.run([searchSearxngDetailed('web', 5, { categories: ['general'], timeRange: 'day' })]);
+    assert(seen.length === 3, 'same query+time_range is a cache hit');
+    await clock.run([searchSearxngDetailed('web', 5, { categories: ['general'], timeRange: 'year' })]);
+    assert((seen.length as number) === 4 && seen[3].time_range === 'year', 'time_range is part of the cache key');
+
+    // J: a later page hitting the queue timeout keeps the earlier results and reports the gap
+    resetConfig();
+    config.searxngRotateEngines = [];
+    config.searxngMaxPages = 3;
+    config.searxngGlobalMaxPerMin = 1;
+    config.searxngQueueTimeoutMs = 3000;
+    mockUpstream(clock, () => ({ results: [rec('p1')] }));
+    const [pg] = await clock.run([searchSearxngDetailed('pages', 10)]);
+    assert(pg.status === 'fulfilled', `partial multi-page is not an error: ${pg.status === 'rejected' ? pg.reason : ''}`);
+    const pv = (pg as PromiseFulfilledResult<Awaited<ReturnType<typeof searchSearxngDetailed>>>).value;
+    assert(pv.results.length === 1 && pv.partialFailures.some((f) => /page 2 not fetched.*queue wait exceeded/.test(f.message)), `kept page 1: ${JSON.stringify(pv.partialFailures)}`);
+    __setSearxngClockForTests();
+    console.log('✅ search: forwarded categories/engines, time_range/safesearch cache key, later-page queue timeout keeps results');
+}
+
+async function testSearchServiceBusyFlag(): Promise<void> {
+    const service = createSearchService({
+        searxng: async () => { throw new SchedulerBusyError('local-search: queue wait exceeded 45s (1 ahead); retry in ~40s, do not retry immediately', 40, 45000); }
+    });
+    const r = await service.execute({ query: 'q', engines: ['searxng'], limit: 5 });
+    assert(r.totalResults === 0 && r.partialFailures[0].retryAfterSec === 40 && r.partialFailures[0].code === 'engine_error', 'busy failure carries retryAfterSec so the tool can answer isError');
+    console.log('✅ search service: busy failures carry retryAfterSec');
+}
+
 async function main(): Promise<void> {
     await testPairIntervalAndFifo();
     await testGlobalLimits();
     await testQueueTimeout();
+    await testEtaQueueDepthAndAbort();
     await testBackoff();
     await testBackoffThroughSearch();
+    await testObservability();
+    await testForwardingAndPages();
+    await testSearchServiceBusyFlag();
     await testSplitDeadlines();
     await testCacheBypassesScheduler();
     __setSearxngHttpGetForTests();

@@ -20,6 +20,7 @@ export type FetchWebService = {
         maxChars: number;
         readability?: boolean;
         includeLinks?: boolean;
+        deadlineMs?: number;
     }): Promise<FetchWebContentResult>;
 };
 
