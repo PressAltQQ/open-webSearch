@@ -175,13 +175,24 @@ npx cross-env DEFAULT_SEARCH_ENGINE=duckduckgo ENABLE_CORS=true open-websearch
 | `SEARXNG_ENGINES` | empty | Comma-separated SearXNG engine names | Passed as `engines=` (e.g. `duckduckgo,brave`); empty uses the instance defaults |
 | `SEARXNG_CATEGORIES` | empty | Comma-separated categories | Passed as `categories=` (e.g. `general`) |
 | `SEARXNG_LANGUAGE` | empty | e.g. `en`, `zh-CN` | Passed as `language=` |
-| `SEARXNG_TIMEOUT_MS` | `10000` | Positive integer | Overall deadline (ms) for one SearXNG search call, shared across all result pages |
-| `SEARXNG_ROTATE_ENGINES` | empty | e.g. `duckduckgo,bing` | Engines that exist on the SearXNG side as per-egress copies named `<engine> <egress>`. Each request picks ONE egress per engine (round-robin, independent counters) and sends `engines=duckduckgo deck,bing vlabs,...`, so a query does not hit every egress IP. If a request returns 0 results and a picked copy is listed in `unresponsive_engines`, it is retried once with the next egress. Requires `SEARXNG_EGRESSES`; replaces `SEARXNG_ENGINES` when active |
+| `SEARXNG_TIMEOUT_MS` | `10000` | Positive integer | Upstream deadline (ms) for one search call (pages and the retry share it). Counts only time spent in flight to SearXNG - it starts after a scheduler slot was acquired and does NOT include queue wait (see `SEARXNG_QUEUE_TIMEOUT_MS`) |
+| `SEARXNG_ROTATE_ENGINES` | empty | e.g. `duckduckgo,bing` | Engines that exist on the SearXNG side as per-egress copies named `<engine> <egress>`. Each request picks ONE egress per engine - the healthy `engine x egress` pair that became available earliest (least recently used, not a blind counter) - and sends `engines=duckduckgo deck,bing vlabs,...`, so a query does not hit every egress IP. Pairs back off when sick (see `SEARXNG_BACKOFF_*`). If a request returns 0 results and a picked copy is unresponsive, the failed engine is retried once on a different healthy pair (through the scheduler, so pair/global limits still apply). Requires `SEARXNG_EGRESSES`; replaces `SEARXNG_ENGINES` when active |
 | `SEARXNG_EGRESSES` | empty | e.g. `deck,vlabs,madrid,almaty` | Egress suffixes used for rotation |
 | `SEARXNG_EXTRA_ENGINES` | empty | e.g. `wikipedia` | Engines appended to every rotated request as-is (rotation only) |
 | `SEARXNG_CACHE_TTL_MS` | `86400000` | Integer >= 0 | In-memory cache TTL (LRU, 1000 entries) keyed by query, language, categories, engine set and page; only non-empty results are cached. `0` disables |
-| `SEARXNG_MAX_CONCURRENCY` | `2` | Integer >= 1 | Max simultaneous upstream SearXNG calls; others queue |
-| `SEARXNG_MIN_INTERVAL_MS` | `1000` | Integer >= 0 | Minimum spacing between upstream SearXNG calls |
+| `SEARXNG_MAX_CONCURRENCY` | `2` | Integer >= 1 | Max simultaneous upstream SearXNG calls; others wait in a FIFO queue |
+| `SEARXNG_MIN_INTERVAL_MS` | `1000` | Integer >= 0 | Minimum spacing between upstream SearXNG calls (global) |
+| `SEARXNG_PAIR_MIN_INTERVAL_MS` | `10000` | Integer >= 0 | Minimum spacing between two uses of the same `engine x egress` pair (rotation only) |
+| `SEARXNG_GLOBAL_MAX_PER_MIN` | `12` | Integer >= 1 | Global ceiling on upstream SearXNG calls in any sliding 60 s window |
+| `SEARXNG_QUEUE_TIMEOUT_MS` | `45000` | Integer >= 1 | How long a search may wait in the FIFO queue (shared by its pages and retry). On expiry the tool returns `isError` with `local-search: queue wait exceeded 45s (N requests ahead), retry later`. Worst case a search takes queue timeout + `SEARXNG_TIMEOUT_MS`, keep that below your MCP client's tool-call timeout (see "MCP client timeouts") |
+| `SEARXNG_BACKOFF_BASE_MS` | `60000` | Integer >= 1 | Cooldown of a sick pair: base x 2^(n-1) after n consecutive failures. A pair is sick if SearXNG lists its engine in `unresponsive_engines` (even when other engines returned results) or if it contributed zero results while the request had results. Success resets. State is in memory only and is lost on restart |
+| `SEARXNG_BACKOFF_MAX_MS` | `3600000` | Integer >= 1 | Cap for the pair cooldown. If all pairs of an engine are cooling, the request is sent without it (reported in `partialFailures`); if nothing is left it waits for the earliest recovery within the queue timeout, else returns a readable error |
+| `SEARXNG_PARTIAL_CACHE_TTL_MS` | `600000` | Integer >= 0 | Cache TTL for incomplete responses (a requested engine was unresponsive or skipped); capped by `SEARXNG_CACHE_TTL_MS` |
+| `SEARXNG_COMPAT_LISTEN` | empty (off) | Loopback `host:port`, e.g. `127.0.0.1:8888` | Serves a SearXNG-compatible `GET/POST /search?q=&format=json&pageno=&language=&categories=` from this process, so plain `curl` clients share the same cache, scheduler, rotation and backoff as the MCP tools (move the real SearXNG to another port and point `SEARXNG_URL` there). Responses: SearXNG-shaped JSON plus `meta`; non-json format `400`; queue timeout `429` with `Retry-After`. Non-loopback addresses are rejected |
+| `FETCH_PER_HOST_CONCURRENCY` | `2` | Integer >= 1 | Max simultaneous `fetchWebContent`/`deepresearch` page fetches per host |
+| `FETCH_PER_HOST_MIN_INTERVAL_MS` | `1000` | Integer >= 0 | Minimum spacing between fetch starts for the same host |
+| `FETCH_MAX_CONCURRENCY` | `4` | Integer >= 1 | Max simultaneous page fetches overall |
+| `FETCH_QUEUE_TIMEOUT_MS` | `30000` | Integer >= 1 | Max wait in the fetch queue before the fetch fails with `fetch queue wait exceeded` |
 | `SEARXNG_MAX_PAGES` | `1` | 1-5 | Max result pages fetched per search |
 | `SEARCH_MODE` | `auto` | `request`, `auto`, `playwright` | Search strategy. Currently only affects Bing: request only, request then Playwright fallback, or force Playwright |
 | `PLAYWRIGHT_PACKAGE` | `auto` | `auto`, `playwright`, `playwright-core` | Which Playwright client package to resolve when browser mode is enabled |
@@ -667,6 +678,15 @@ Response example:
   }
 ]
 ```
+
+## SearXNG rate limiting and MCP client timeouts
+
+With `SEARXNG_*` rotation configured every search is scheduled: FIFO queue, per-pair interval, global per-minute ceiling, per-pair exponential backoff, cache check before the queue. Each search logs one structured stderr line (`[local-search] search {...}`: query, cache, queued_ms, upstream_ms, pairs, unresponsive engines, backoff changes, queue depth) and the `search` tool JSON carries `meta: {queued_ms, upstream_ms, egress, cache, unresponsive, queue_depth}` next to `partialFailures`. Page fetches log `[local-search] fetch {host, queued_ms}`.
+
+A search can take up to `SEARXNG_QUEUE_TIMEOUT_MS` + `SEARXNG_TIMEOUT_MS` (default 45 s + 10 s = 55 s). That must stay below the MCP client's tool-call timeout:
+
+- Claude Code: `MCP_TOOL_TIMEOUT` (ms) env var, optional per-server `timeout` in `.mcp.json`; documented default is very large (about 28 hours), so queue + upstream is safe. Some builds/transports are reported to enforce shorter limits (the TypeScript MCP SDK default request timeout is 60 s).
+- opencode: the per-server `timeout` field in `opencode.json` (default 5000 ms per the docs, described there as the tool-fetch timeout; tool-call behaviour not verified). If your client enforces 30-60 s, lower `SEARXNG_QUEUE_TIMEOUT_MS` (e.g. `20000`) or raise the client timeout.
 
 ## Usage Limitations
 
