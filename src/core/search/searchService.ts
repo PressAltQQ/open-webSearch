@@ -2,18 +2,20 @@ import { SearchResult } from '../../types.js';
 import { AppConfig } from '../../config.js';
 import { distributeLimit } from './searchEngines.js';
 
+export type SearchExecutionFailure = {
+    engine: string;
+    code: 'engine_error' | 'unsupported_engine' | 'engine_degraded';
+    message: string;
+};
+
 export type SearchExecutionContext = {
     searchMode?: AppConfig['searchMode'];
+    /** engines may report diagnostics (timings, egress, degraded sub-engines) alongside results */
+    report?: (info: { meta?: Record<string, unknown>; partialFailures?: SearchExecutionFailure[] }) => void;
 };
 
 export type SearchEngineExecutor = (query: string, limit: number, context?: SearchExecutionContext) => Promise<SearchResult[]>;
 export type SearchEngineExecutorMap = Partial<Record<string, SearchEngineExecutor>>;
-
-export type SearchExecutionFailure = {
-    engine: string;
-    code: 'engine_error' | 'unsupported_engine';
-    message: string;
-};
 
 export type SearchExecutionResult = {
     query: string;
@@ -21,6 +23,7 @@ export type SearchExecutionResult = {
     totalResults: number;
     results: SearchResult[];
     partialFailures: SearchExecutionFailure[];
+    meta?: Record<string, unknown>;
 };
 
 export type SearchExecutionInput = {
@@ -45,6 +48,11 @@ export function createSearchService(engineMap: SearchEngineExecutorMap) {
 
             const limits = distributeLimit(limit, engines.length);
             const partialFailures: SearchExecutionFailure[] = [];
+            let meta: Record<string, unknown> | undefined;
+            const report: NonNullable<SearchExecutionContext['report']> = (info) => {
+                if (info.meta) meta = { ...meta, ...info.meta };
+                if (info.partialFailures) partialFailures.push(...info.partialFailures);
+            };
             const effectiveSearchMode = resolveSearchModeOverride(searchMode);
 
             const tasks = engines.map(async (engine, index) => {
@@ -61,7 +69,7 @@ export function createSearchService(engineMap: SearchEngineExecutorMap) {
                 }
 
                 try {
-                    return await executor(cleanQuery, engineLimit, { searchMode: effectiveSearchMode });
+                    return await executor(cleanQuery, engineLimit, { searchMode: effectiveSearchMode, report });
                 } catch (error) {
                     partialFailures.push({
                         engine,
@@ -79,7 +87,8 @@ export function createSearchService(engineMap: SearchEngineExecutorMap) {
                 engines,
                 totalResults: results.length,
                 results,
-                partialFailures
+                partialFailures,
+                ...(meta ? { meta } : {})
             };
         }
     };

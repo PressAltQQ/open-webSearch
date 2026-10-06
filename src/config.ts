@@ -36,6 +36,18 @@ export interface AppConfig {
     searxngMaxConcurrency?: number;
     searxngMinIntervalMs?: number;
     searxngMaxPages?: number;
+    searxngPairMinIntervalMs?: number;
+    searxngGlobalMaxPerMin?: number;
+    searxngQueueTimeoutMs?: number;
+    searxngBackoffBaseMs?: number;
+    searxngBackoffMaxMs?: number;
+    searxngPartialCacheTtlMs?: number;
+    searxngCompatListen?: string;
+    // Web fetch limiter (fetchWebContent / deepresearch)
+    fetchPerHostConcurrency?: number;
+    fetchPerHostMinIntervalMs?: number;
+    fetchMaxConcurrency?: number;
+    fetchQueueTimeoutMs?: number;
     // CORS configuration
     enableCors: boolean;
     corsOrigin: string;
@@ -87,6 +99,17 @@ export const config: AppConfig = {
     searxngMaxConcurrency: Number(process.env.SEARXNG_MAX_CONCURRENCY ?? 2),
     searxngMinIntervalMs: Number(process.env.SEARXNG_MIN_INTERVAL_MS ?? 1000),
     searxngMaxPages: Number(process.env.SEARXNG_MAX_PAGES ?? 1),
+    searxngPairMinIntervalMs: Number(process.env.SEARXNG_PAIR_MIN_INTERVAL_MS ?? 10000),
+    searxngGlobalMaxPerMin: Number(process.env.SEARXNG_GLOBAL_MAX_PER_MIN ?? 12),
+    searxngQueueTimeoutMs: Number(process.env.SEARXNG_QUEUE_TIMEOUT_MS ?? 45000),
+    searxngBackoffBaseMs: Number(process.env.SEARXNG_BACKOFF_BASE_MS ?? 60000),
+    searxngBackoffMaxMs: Number(process.env.SEARXNG_BACKOFF_MAX_MS ?? 3600000),
+    searxngPartialCacheTtlMs: Number(process.env.SEARXNG_PARTIAL_CACHE_TTL_MS ?? 600000),
+    searxngCompatListen: readOptionalEnv('SEARXNG_COMPAT_LISTEN'),
+    fetchPerHostConcurrency: Number(process.env.FETCH_PER_HOST_CONCURRENCY ?? 2),
+    fetchPerHostMinIntervalMs: Number(process.env.FETCH_PER_HOST_MIN_INTERVAL_MS ?? 1000),
+    fetchMaxConcurrency: Number(process.env.FETCH_MAX_CONCURRENCY ?? 4),
+    fetchQueueTimeoutMs: Number(process.env.FETCH_QUEUE_TIMEOUT_MS ?? 30000),
     // CORS configuration
     enableCors: process.env.ENABLE_CORS === 'true',
     corsOrigin: process.env.CORS_ORIGIN || '*',
@@ -149,7 +172,13 @@ if (!Number.isFinite(config.searxngTimeoutMs) || (config.searxngTimeoutMs ?? 0) 
     config.searxngTimeoutMs = 10000;
 }
 
-function fixNumber(name: string, key: 'searxngCacheTtlMs' | 'searxngMaxConcurrency' | 'searxngMinIntervalMs' | 'searxngMaxPages', fallback: number, min: number, max = Infinity): void {
+type NumericConfigKey =
+    | 'searxngCacheTtlMs' | 'searxngMaxConcurrency' | 'searxngMinIntervalMs' | 'searxngMaxPages'
+    | 'searxngPairMinIntervalMs' | 'searxngGlobalMaxPerMin' | 'searxngQueueTimeoutMs'
+    | 'searxngBackoffBaseMs' | 'searxngBackoffMaxMs' | 'searxngPartialCacheTtlMs'
+    | 'fetchPerHostConcurrency' | 'fetchPerHostMinIntervalMs' | 'fetchMaxConcurrency' | 'fetchQueueTimeoutMs';
+
+function fixNumber(name: string, key: NumericConfigKey, fallback: number, min: number, max = Infinity): void {
     const value = config[key] as number;
     if (!Number.isFinite(value) || value < min) {
         console.warn(`Invalid ${name}: "${process.env[name]}", falling back to ${fallback}`);
@@ -162,6 +191,21 @@ fixNumber('SEARXNG_CACHE_TTL_MS', 'searxngCacheTtlMs', 86400000, 0);
 fixNumber('SEARXNG_MAX_CONCURRENCY', 'searxngMaxConcurrency', 2, 1);
 fixNumber('SEARXNG_MIN_INTERVAL_MS', 'searxngMinIntervalMs', 1000, 0);
 fixNumber('SEARXNG_MAX_PAGES', 'searxngMaxPages', 1, 1, 5);
+fixNumber('SEARXNG_PAIR_MIN_INTERVAL_MS', 'searxngPairMinIntervalMs', 10000, 0);
+fixNumber('SEARXNG_GLOBAL_MAX_PER_MIN', 'searxngGlobalMaxPerMin', 12, 1);
+fixNumber('SEARXNG_QUEUE_TIMEOUT_MS', 'searxngQueueTimeoutMs', 45000, 1);
+fixNumber('SEARXNG_BACKOFF_BASE_MS', 'searxngBackoffBaseMs', 60000, 1);
+fixNumber('SEARXNG_BACKOFF_MAX_MS', 'searxngBackoffMaxMs', 3600000, 1);
+fixNumber('SEARXNG_PARTIAL_CACHE_TTL_MS', 'searxngPartialCacheTtlMs', 600000, 0);
+fixNumber('FETCH_PER_HOST_CONCURRENCY', 'fetchPerHostConcurrency', 2, 1);
+fixNumber('FETCH_PER_HOST_MIN_INTERVAL_MS', 'fetchPerHostMinIntervalMs', 1000, 0);
+fixNumber('FETCH_MAX_CONCURRENCY', 'fetchMaxConcurrency', 4, 1);
+fixNumber('FETCH_QUEUE_TIMEOUT_MS', 'fetchQueueTimeoutMs', 30000, 1);
+
+if ((config.searxngBackoffMaxMs ?? 0) < (config.searxngBackoffBaseMs ?? 0)) {
+    console.warn('SEARXNG_BACKOFF_MAX_MS is below SEARXNG_BACKOFF_BASE_MS; using the base value as the cap');
+    config.searxngBackoffMaxMs = config.searxngBackoffBaseMs;
+}
 
 if ((config.searxngRotateEngines?.length ?? 0) > 0 && (config.searxngEgresses?.length ?? 0) === 0) {
     console.warn('SEARXNG_ROTATE_ENGINES is set but SEARXNG_EGRESSES is empty; rotation is disabled');

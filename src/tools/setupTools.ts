@@ -124,7 +124,8 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                             engines: searchResult.engines,
                             totalResults: searchResult.totalResults,
                             results: searchResult.results,
-                            partialFailures: searchResult.partialFailures
+                            partialFailures: searchResult.partialFailures,
+                            ...(searchResult.meta ? { meta: searchResult.meta } : {})
                         }, null, 2)
                     }]
                 };

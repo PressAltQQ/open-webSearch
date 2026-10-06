@@ -45,17 +45,35 @@ function resetRotationConfig(): void {
     config.searxngRotateEngines = ['duckduckgo', 'bing'];
     config.searxngEgresses = ['deck', 'vlabs', 'madrid'];
     config.searxngExtraEngines = ['wikipedia'];
+    config.searxngPairMinIntervalMs = 0;
+    config.searxngGlobalMaxPerMin = 1000;
+    config.searxngQueueTimeoutMs = 5000;
+}
+
+// Results as SearXNG returns them for a rotated request: tagged with the per-egress engine copies requested.
+function rotatedItems(params: Record<string, unknown>, n: number): object[] {
+    const names = String(params.engines ?? '').split(',').filter((e) => e.includes(' '));
+    return names.map((name, i) => item(n * 10 + i, { engine: name, engines: [name] }));
+}
+
+function mockRotated(): void {
+    calls.length = 0;
+    __setSearxngHttpGetForTests(async (url, options) => {
+        const params = options.params as Record<string, unknown>;
+        calls.push({ url, params, proxy: options.proxy });
+        return { status: 200, data: { results: rotatedItems(params, calls.length) } } as any;
+    });
 }
 
 async function testRotation(): Promise<void> {
     resetRotationConfig();
-    mockPages(Array.from({ length: 10 }, (_, i) => ({ data: { results: [item(i)] } })));
+    mockRotated();
     for (let i = 0; i < 4; i++) await searchSearxng(`q${i}`, 1);
     const engines = calls.map(c => c.params.engines);
     assert(engines[0] === 'duckduckgo deck,bing deck,wikipedia', `first: ${engines[0]}`);
     assert(engines[1] === 'duckduckgo vlabs,bing vlabs,wikipedia', `second: ${engines[1]}`);
     assert(engines[2] === 'duckduckgo madrid,bing madrid,wikipedia', `third: ${engines[2]}`);
-    assert(engines[3] === 'duckduckgo deck,bing deck,wikipedia', `wraps: ${engines[3]}`);
+    assert(engines[3] === 'duckduckgo deck,bing deck,wikipedia', `wraps (least recently used): ${engines[3]}`);
     const r = await searchSearxng('label', 1);
     assert(r[0].engine === 'searxng:duckduckgo,bing,wikipedia', `label: ${r[0].engine}`);
     console.log('✅ rotation round-robin');
@@ -64,14 +82,16 @@ async function testRotation(): Promise<void> {
     resetRotationConfig();
     mockPages([
         { data: { results: [], unresponsive_engines: [['duckduckgo deck', 'Suspended: too many requests']] } },
-        { data: { results: [item(1)] } },
-        { data: { results: [item(2)] } }
+        { data: { results: [item(1, { engine: 'duckduckgo vlabs', engines: ['duckduckgo vlabs'] })] } },
+        { data: { results: [item(2, { engine: 'duckduckgo madrid', engines: ['duckduckgo madrid'] }), item(3, { engine: 'bing vlabs', engines: ['bing vlabs'] })] } }
     ]);
     const res = await searchSearxng('retry', 1);
     assert(res.length === 1 && (calls.length as number) === 2, `retried once, calls=${calls.length}`);
-    assert(calls[1].params.engines === 'duckduckgo vlabs,bing deck,wikipedia', `retry engines: ${calls[1].params.engines}`);
+    // the retry asks only the failed engine, on a different healthy pair
+    assert(calls[1].params.engines === 'duckduckgo vlabs', `retry engines: ${calls[1].params.engines}`);
     await searchSearxng('next', 1);
-    assert(calls[2].params.engines === 'duckduckgo madrid,bing vlabs,wikipedia', `independent counters: ${calls[2].params.engines}`);
+    // deck is cooling for duckduckgo (sick pair skipped); bing deck was used last -> bing prefers vlabs
+    assert(calls[2].params.engines === 'duckduckgo madrid,bing vlabs,wikipedia', `sick pair skipped, LRU for the rest: ${calls[2].params.engines}`);
     console.log('✅ rotation retry with next egress');
 
     // retry exhausted -> explicit error
@@ -91,6 +111,7 @@ async function testCache(): Promise<void> {
     let t = 1_000_000;
     __setSearxngClockForTests({ now: () => t, sleep: async () => {} });
     mockPages(Array.from({ length: 10 }, (_, i) => ({ data: { results: [item(i)] } })));
+    config.searxngRotateEngines = [];
     await searchSearxng('cached', 1);
     await searchSearxng('cached', 1);
     assert(calls.length === 1, `second call served from cache, calls=${calls.length}`);
@@ -166,6 +187,9 @@ async function main(): Promise<void> {
     config.searxngMinIntervalMs = 0;
     config.searxngCacheTtlMs = 0; // cache off except in the cache tests
     config.searxngMaxConcurrency = 2;
+    config.searxngPairMinIntervalMs = 0;
+    config.searxngGlobalMaxPerMin = 1000;
+    config.searxngQueueTimeoutMs = 5000;
 
     // request shape + normalization
     mockPages([{ data: { results: [item(1), item(2)] } }]);
