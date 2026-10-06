@@ -3,7 +3,7 @@
 // scheduler, rotation and backoff, so nobody can bypass the rate limits by talking to SearXNG directly.
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { searchSearxngDetailed, QueueTimeoutError, AllPairsCoolingError } from '../../engines/searxng/searxng.js';
+import { searchSearxngDetailed, SchedulerBusyError, QueueAbortedError, UpstreamUnresponsiveError } from '../../engines/searxng/searxng.js';
 
 const MAX_BODY_BYTES = 64 * 1024;
 const COMPAT_RESULTS_PER_PAGE = 1000; // a page is whatever SearXNG returned; do not truncate it
@@ -25,15 +25,20 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown, heade
     res.end(payload);
 }
 
+class BodyTooLargeError extends Error {}
+
 function readBody(req: http.IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
         let size = 0;
+        let tooLarge = false;
         const chunks: Buffer[] = [];
         req.on('data', (chunk: Buffer) => {
+            if (tooLarge) return; // keep draining so the 413 can still be delivered
             size += chunk.length;
             if (size > MAX_BODY_BYTES) {
-                reject(new Error('request body too large'));
-                req.destroy();
+                tooLarge = true;
+                chunks.length = 0;
+                reject(new BodyTooLargeError('request body too large'));
                 return;
             }
             chunks.push(chunk);
@@ -45,6 +50,9 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 
 export function createSearxngCompatServer(): http.Server {
     return http.createServer(async (req, res) => {
+        // A client that hangs up while queued must free its place in the queue.
+        const abort = new AbortController();
+        res.on('close', () => { if (!res.writableFinished) abort.abort(); });
         try {
             const url = new URL(req.url ?? '/', 'http://localhost');
             if (url.pathname !== '/search') return sendJson(res, 404, { error: 'not found' });
@@ -60,28 +68,45 @@ export function createSearxngCompatServer(): http.Server {
             if (params.get('format') !== 'json') return sendJson(res, 400, { error: 'only format=json is supported' });
             const pageno = params.has('pageno') ? Number(params.get('pageno')) : 1;
             if (!Number.isInteger(pageno) || pageno < 1) return sendJson(res, 400, { error: 'invalid pageno' });
-            const categories = params.get('categories')?.split(',').map((c) => c.trim()).filter(Boolean);
+            const csv = (name: string) => params.get(name)?.split(',').map((c) => c.trim()).filter(Boolean) ?? [];
+            const categories = csv('categories');
+            const engines = csv('engines');
 
             try {
                 const found = await searchSearxngDetailed(q, COMPAT_RESULTS_PER_PAGE, {
                     pageno,
                     language: params.get('language') || undefined,
-                    categories: categories && categories.length > 0 ? categories : undefined
+                    categories: categories.length > 0 ? categories : undefined,
+                    timeRange: params.get('time_range') || undefined,
+                    safesearch: params.get('safesearch') || undefined,
+                    engines: engines.length > 0 ? engines : undefined,
+                    signal: abort.signal
                 });
+                if (res.destroyed) return;
                 return sendJson(res, 200, {
                     query: q,
-                    number_of_results: found.results.length,
-                    results: found.results.map((r) => ({ title: r.title, url: r.url, content: r.description, engine: r.source })),
-                    unresponsive_engines: found.rawUnresponsive,
+                    number_of_results: found.extras.number_of_results ?? found.rawResults.length,
+                    results: found.rawResults, // upstream objects untouched (engine, engines, score, publishedDate, ...)
+                    answers: found.extras.answers,
+                    infoboxes: found.extras.infoboxes,
+                    suggestions: found.extras.suggestions,
+                    corrections: found.extras.corrections,
+                    unresponsive_engines: [...found.rawUnresponsive, ...found.skipped.map((engine) => [engine, 'cooling down'])],
                     meta: found.meta
                 });
             } catch (error) {
-                if (error instanceof QueueTimeoutError || error instanceof AllPairsCoolingError) {
+                if (error instanceof QueueAbortedError || res.destroyed) return;
+                if (error instanceof SchedulerBusyError) {
                     return sendJson(res, 429, { error: error.message }, { 'Retry-After': String(error.retryAfterSec) });
+                }
+                if (error instanceof UpstreamUnresponsiveError) {
+                    return sendJson(res, 503, { error: error.message, unresponsive_engines: error.rawUnresponsive }, { 'Retry-After': String(error.retryAfterSec) });
                 }
                 return sendJson(res, 502, { error: error instanceof Error ? error.message : String(error) });
             }
         } catch (error) {
+            if (res.destroyed) return;
+            if (error instanceof BodyTooLargeError) return sendJson(res, 413, { error: 'request body too large' }, { Connection: 'close' });
             sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
     });

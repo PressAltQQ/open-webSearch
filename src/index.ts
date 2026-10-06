@@ -83,7 +83,10 @@ async function main() {
       const { startSearxngCompatServer } = await import('./adapters/http/searxngCompat.js');
       await startSearxngCompatServer(config.searxngCompatListen);
     } catch (error) {
-      console.error('❌ SearXNG compat endpoint not started:', error instanceof Error ? error.message : error);
+      // A configured but unbound compat endpoint means clients can bypass the limiter: fail loudly so the
+      // supervisor (systemd) restarts us and a misdeploy is visible.
+      console.error('❌ SearXNG compat endpoint failed to start, exiting:', error instanceof Error ? error.message : error);
+      process.exit(1);
     }
   }
 
