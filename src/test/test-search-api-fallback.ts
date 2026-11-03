@@ -342,6 +342,8 @@ async function testFailClosedCounterFile(): Promise<void> {
         console.error = orig;
     }
     assert(logs.filter((l) => l.includes('usage file unreadable, paid calls refused')).length === 1, 'unreadable logged once per month');
+    assert(logs.some((l) => l.includes('"status":"refused_unreadable"')) && !logs.some((l) => l.includes('"status":"over_budget"')), 'api line says refused_unreadable, not over_budget');
+    assert(!logs.some((l) => l.includes('api budget exhausted')), 'unreadable does not consume the exhaustion announcement');
     console.log('✅ fails closed on unreadable/negative counter file');
 }
 
@@ -416,6 +418,17 @@ async function testThrottleBraveOnly(): Promise<void> {
     console.log('✅ queue throttle falls back to Brave only');
 }
 
+async function testThrottleCacheReusedByNormalPath(): Promise<void> {
+    fresh();
+    mode = 'throttled';
+    await search('reuse');
+    assert(calls.length === 1, 'throttled search paid once');
+    mode = 'degraded';
+    const r = await search('reuse');
+    assert(calls.length === 1 && jsonOf(r.text).fallback === 'brave', `normal path reuses brave-only cache, calls=${calls.length}`);
+    console.log('✅ brave-only cache reused by normal path');
+}
+
 async function testExhaustionLogging(): Promise<void> {
     fresh();
     mode = 'degraded';
@@ -469,6 +482,7 @@ async function main(): Promise<void> {
     await testExaToolValidation();
     await testThrottleBraveOnly();
     await testExhaustionLogging();
+    await testThrottleCacheReusedByNormalPath();
     __setSearchApiHttpForTests();
     __setSearchApiClockForTests();
     rmSync(stateRoot, { recursive: true, force: true });

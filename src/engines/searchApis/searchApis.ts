@@ -61,7 +61,9 @@ function logOnce(id: string, line: string): void {
     console.error(line);
 }
 
-class BudgetError extends Error {}
+class BudgetError extends Error {
+    constructor(message: string, readonly unreadable = false) { super(message); }
+}
 
 const keyOf = (provider: ApiProvider): string | undefined =>
     (provider === 'brave' ? process.env.BRAVE_SEARCH_API_KEY : process.env.EXA_API_KEY)?.trim() || undefined;
@@ -105,7 +107,7 @@ function loadUsage(): UsageFile {
     const file = usagePath();
     const unreadable = (): BudgetError => {
         logOnce(`unreadable:${month}:${file}`, `[local-search] api usage file unreadable, paid calls refused until fixed: ${file}`);
-        return new BudgetError(`usage file unreadable: ${file}`);
+        return new BudgetError(`usage file unreadable: ${file}`, true);
     };
     let text: string;
     try {
@@ -178,7 +180,10 @@ async function paidCall(provider: ApiProvider, query: string, request: Omit<Para
     try {
         reserved = reserve(provider, tool);
     } catch (error) {
-        if (error instanceof BudgetError) {
+        if (error instanceof BudgetError && error.unreadable) {
+            // the file-level reason is logged once by loadUsage; this is only the per-call refusal
+            console.error(`[local-search] api ${redactSecrets(JSON.stringify({ provider, query: clip(query), status: 'refused_unreadable', ms: 0, limit: limitOf(provider) }))}`);
+        } else if (error instanceof BudgetError) {
             const { month } = getApiUsage();
             logOnce(`exhausted:${month}:${provider}${tool ? ':tool' : ''}`, `[local-search] api budget exhausted for ${provider}${tool ? ' (searchExa tool cap)' : ''} in ${month}: ${errorText(error)}`);
             console.error(`[local-search] api ${redactSecrets(JSON.stringify({ provider, query: clip(query), status: 'over_budget', ms: 0, used: getApiUsage().providers[provider].used, limit: limitOf(provider) }))}`);
@@ -286,6 +291,12 @@ export async function searchExaTool(query: string, opts: { numResults?: number; 
  */
 export async function searchWithFallback(query: string, limit: number, options: { braveOnly?: boolean } = {}): Promise<FallbackOutcome> {
     const key = JSON.stringify(['fallback', query, limit, options.braveOnly === true]);
+    if (!options.braveOnly) {
+        // a Brave answer already paid for under throttle serves the normal path too
+        const braveHit = cache.get(JSON.stringify(['fallback', query, limit, true]));
+        const value = braveHit?.value as FallbackOutcome | undefined;
+        if (braveHit && braveHit.expires > clock.now() && value?.provider === 'brave') return value;
+    }
     return cachedCall<FallbackOutcome>(key, async () => {
         const failures: string[] = [];
         for (const provider of PROVIDERS) {
