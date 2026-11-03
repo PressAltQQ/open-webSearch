@@ -8,6 +8,8 @@ export type SearchExecutionFailure = {
     message: string;
     /** set for "come back later" conditions (queue timeout, queue full, cooling): seconds to wait */
     retryAfterSec?: number;
+    /** our own throttle (queue full/timeout/no capacity), not an engine failure */
+    throttled?: boolean;
 };
 
 export type SearchDegraded = { engines: string[]; reasons: string[] };
@@ -90,7 +92,8 @@ export function createSearchService(engineMap: SearchEngineExecutorMap) {
                         message: error instanceof Error ? error.message : String(error),
                         ...(typeof (error as { retryAfterSec?: unknown })?.retryAfterSec === 'number'
                             ? { retryAfterSec: (error as { retryAfterSec: number }).retryAfterSec }
-                            : {})
+                            : {}),
+                        ...(['QueueFullError', 'QueueTimeoutError', 'NoCapacityError'].includes((error as { name?: string })?.name ?? '') ? { throttled: true } : {})
                     });
                     return [];
                 }

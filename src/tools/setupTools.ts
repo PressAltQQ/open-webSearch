@@ -24,6 +24,13 @@ function degradedWarning(degraded: NonNullable<SearchOutcome['degraded']>, fallb
     return `WARNING: primary web search engine unavailable (${reasons.join('; ')}); results below come only from the remaining engines (e.g. wikipedia/keenable) and may miss news, company and pricing pages. Retry later or use another search tool.`;
 }
 
+function fallbackNote(provider: 'brave' | 'exa', earlierFailures: string[]): string {
+    const base = provider === 'brave'
+        ? 'NOTE: primary engine unavailable; results from Brave fallback (full web index, no retry needed).'
+        : 'NOTE: primary engine unavailable; results from Exa fallback without snippets \u2014 open pages with fetchWebContent before citing.';
+    return earlierFailures.length > 0 ? `${base} (${earlierFailures.join('; ')})` : base;
+}
+
 // Zero results because of a failure (not because nothing exists): fail loudly instead of an empty result.
 function zeroResultFailure(result: SearchOutcome, fallbackFailures: string[] = []): { content: Array<{ type: 'text'; text: string }>; isError: true } | undefined {
     if (result.totalResults > 0 || (result.partialFailures.length === 0 && !result.degraded)) return undefined;
@@ -146,7 +153,10 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                 let fallback: FallbackOutcome | undefined;
                 const needsFallback = searchResult.engines.includes('searxng')
                     && (searchResult.degraded !== undefined || (searchResult.totalResults === 0 && searchResult.partialFailures.length > 0));
-                if (needsFallback) fallback = await searchWithFallback(query, limit);
+                // our own queue throttle is not an engine outage: spend only Brave on it, never Exa
+                const braveOnly = !searchResult.degraded && searchResult.totalResults === 0
+                    && searchResult.partialFailures.length > 0 && searchResult.partialFailures.every((f) => f.throttled);
+                if (needsFallback) fallback = await searchWithFallback(query, limit, { braveOnly });
                 const fallbackFailures = fallback?.failures ?? [];
 
                 if (fallback?.provider) {
@@ -161,9 +171,10 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                         partialFailures: searchResult.partialFailures,
                         fallback: fallback.provider,
                         degradedReasons: reasons,
+                        ...(fallbackFailures.length > 0 ? { fallbackFailures } : {}),
                         ...(searchResult.meta ? { meta: searchResult.meta } : {})
                     }, null, 2);
-                    return { content: [{ type: 'text', text: `NOTE: primary engine unavailable; results from ${fallback.provider} fallback.\n\n${fbJson}` }] };
+                    return { content: [{ type: 'text', text: `${fallbackNote(fallback.provider, fallbackFailures)}\n\n${fbJson}` }] };
                 }
 
                 const busy = searchResult.partialFailures.filter((f) => f.retryAfterSec !== undefined);

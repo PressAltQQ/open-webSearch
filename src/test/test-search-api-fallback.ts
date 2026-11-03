@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -11,6 +11,8 @@ import {
     getApiUsage, redactSecrets, type HttpRequest
 } from '../engines/searchApis/searchApis.js';
 
+const BRAVE_NOTE = 'NOTE: primary engine unavailable; results from Brave fallback (full web index, no retry needed).';
+const EXA_NOTE = 'NOTE: primary engine unavailable; results from Exa fallback without snippets \u2014 open pages with fetchWebContent before citing.';
 const BRAVE_KEY = 'brave-secret-key-123';
 const EXA_KEY = 'exa-secret-key-456';
 const stateRoot = mkdtempSync(path.join(tmpdir(), 'owsearch-api-'));
@@ -63,7 +65,7 @@ function fresh(brave = true, exa = true): void {
 
 const wiki = { title: 'Wiki', url: 'https://wiki.example/1', description: 'w', source: 'wikipedia', engine: 'searxng' };
 const dup = { title: 'Dup', url: 'https://brave.example/1', description: 'dupe', source: 'wikipedia', engine: 'searxng' };
-type Mode = 'healthy' | 'degraded' | 'failure';
+type Mode = 'healthy' | 'degraded' | 'failure' | 'throttled';
 let mode: Mode = 'degraded';
 let primaryCalls = 0;
 
@@ -74,6 +76,7 @@ function makeTools() {
             searchExecutors: {
                 searxng: async (_q, _l, context) => {
                     primaryCalls++;
+                    if (mode === 'throttled') throw Object.assign(new Error('local-search: queue full'), { name: 'QueueFullError', retryAfterSec: 5 });
                     if (mode === 'failure') throw new Error('SearXNG: no results - upstream engines rate-limited/unresponsive');
                     if (mode === 'degraded') context?.report?.({ degraded: { engines: ['duckduckgo'], reasons: ['duckduckgo: returned no results'] } });
                     return [wiki, dup];
@@ -127,7 +130,7 @@ async function testBraveFallbackOnDegraded(): Promise<void> {
     assert(calls.length === 1 && calls[0].url === 'https://api.search.brave.com/res/v1/web/search', `brave url: ${calls[0]?.url}`);
     assert(calls[0].headers['X-Subscription-Token'] === BRAVE_KEY, 'brave auth header');
     assert(calls[0].params?.q === 'q-brave' && calls[0].params?.count === 10, 'brave params');
-    assert(r.text.split('\n')[0] === 'NOTE: primary engine unavailable; results from brave fallback.', `NOTE line: ${r.text.split('\n')[0]}`);
+    assert(r.text.split('\n')[0] === BRAVE_NOTE, `NOTE line: ${r.text.split('\n')[0]}`);
     assert(!r.text.includes('WARNING'), 'no WARNING when fallback delivered');
     const j = jsonOf(r.text);
     assert(j.fallback === 'brave', 'fallback field');
@@ -147,7 +150,8 @@ async function testBraveThenExa(): Promise<void> {
     assert(calls[1].headers['x-api-key'] === EXA_KEY && calls[1].method === 'POST', 'exa auth/method');
     const body = calls[1].data as any;
     assert(body.query === 'q-exa' && body.numResults <= 10 && body.type === 'lite', `exa body ${JSON.stringify(body)}`);
-    assert(r.text.split('\n')[0] === 'NOTE: primary engine unavailable; results from exa fallback.', 'exa NOTE');
+    assert(r.text.split('\n')[0] === `${EXA_NOTE} (brave: HTTP 429 (rate limited))`, `exa NOTE: ${r.text.split('\n')[0]}`);
+    assert(jsonOf(r.text).fallbackFailures[0].startsWith('brave: HTTP 429'), 'failures kept in JSON');
     assert(jsonOf(r.text).fallback === 'exa' && jsonOf(r.text).results[0].url === 'https://exa.example/1', 'exa first');
     // Brave returning zero results counts as a failed fallback too
     fresh();
@@ -176,7 +180,7 @@ async function testZeroResultFailureFallback(): Promise<void> {
     fresh();
     mode = 'failure';
     const r = await search('q-zero');
-    assert(!r.isError && r.text.startsWith('NOTE: primary engine unavailable; results from brave fallback.'), `zero-result failure -> fallback: ${r.text.slice(0, 100)}`);
+    assert(!r.isError && r.text.startsWith(BRAVE_NOTE), `zero-result failure -> fallback: ${r.text.slice(0, 100)}`);
     assert(jsonOf(r.text).results.length === 2, 'brave results only');
     console.log('✅ zero-result failure falls back');
 }
@@ -204,7 +208,7 @@ async function testBudgetAndPersistence(): Promise<void> {
 
 async function testExaBudgetDefaultsAndCountBeforeSend(): Promise<void> {
     fresh();
-    assert(getApiUsage().providers.brave.limit === 900 && getApiUsage().providers.exa.limit === 1500, 'default limits 900/1500');
+    assert(getApiUsage().providers.brave.limit === 900 && getApiUsage().providers.exa.limit === 1400 && getApiUsage().exaTool.limit === 300, 'default limits 900/1400, tool 300');
     mode = 'degraded';
     handlers.brave = () => { throw new Error('boom'); };
     await search('cb');
@@ -295,6 +299,140 @@ async function testSearchExaTool(): Promise<void> {
     console.log('✅ searchExa tool');
 }
 
+async function testConcurrentRateLimit(): Promise<void> {
+    fresh(true, false);
+    mode = 'degraded';
+    // sleep resolves to the slot time computed when it was called, like a real timer
+    // virtual timers: only the earliest sleeper wakes at a time, and the clock jumps to its target
+    const waiters: Array<{ target: number; wake: () => void }> = [];
+    const drive = (): void => {
+        setTimeout(() => {
+            const next = waiters.sort((a, b) => a.target - b.target).shift();
+            if (next) { now = Math.max(now, next.target); next.wake(); }
+            if (waiters.length > 0) drive();
+        }, 0);
+    };
+    __setSearchApiClockForTests({ now: () => now, sleep: (ms) => new Promise<void>((resolve) => { waiters.push({ target: now + ms, wake: resolve }); drive(); }) });
+    const t0 = now;
+    const sendTimes: number[] = [];
+    __setSearchApiHttpForTests(async () => { sendTimes.push(now - t0); return braveOk(); });
+    await Promise.all([search('c1'), search('c2'), search('c3')]);
+    assert(sendTimes.length === 3 && sendTimes[1] - sendTimes[0] >= 1000 && sendTimes[2] - sendTimes[1] >= 1000, `concurrent brave sends >=1s apart: ${sendTimes}`);
+    console.log('✅ concurrent calls respect the rate limit');
+}
+
+async function testFailClosedCounterFile(): Promise<void> {
+    fresh();
+    mode = 'degraded';
+    await search('f1');
+    const logs: string[] = [];
+    const orig = console.error;
+    console.error = (...a: unknown[]) => { logs.push(a.map(String).join(' ')); };
+    try {
+        for (const bad of ['', '{"month":"2026-11","usage":{"brave":-5,"exa":0}}', '{"month":"2026-11","usage":{"brave":"x"}}', 'not json']) {
+            writeFileSync(usageFile(), bad);
+            calls.length = 0;
+            const r = await search(`fc-${bad.length}`);
+            assert(calls.length === 0, `no paid call with bad counter file (${JSON.stringify(bad)})`);
+            assert(r.text.includes('usage file unreadable') && r.text.startsWith('WARNING'), `reason shown: ${r.text.slice(0, 200)}`);
+            assert(readFileSync(usageFile(), 'utf8') === bad, 'bad file not overwritten');
+            assert(getApiUsage().error?.includes('usage file unreadable'), 'status shows error');
+        }
+    } finally {
+        console.error = orig;
+    }
+    assert(logs.filter((l) => l.includes('usage file unreadable, paid calls refused')).length === 1, 'unreadable logged once per month');
+    console.log('✅ fails closed on unreadable/negative counter file');
+}
+
+async function testExaToolCapsAndSharedCounter(): Promise<void> {
+    fresh(false, true);
+    process.env.EXA_TOOL_MONTHLY_LIMIT = '2';
+    const { tools } = makeTools();
+    await tools.searchExa.handler({ query: 't1' });
+    await tools.searchExa.handler({ query: 't2' });
+    assert(getApiUsage().providers.exa.used === 2 && getApiUsage().exaTool.used === 2, 'tool counts toward both caps');
+    const over = await tools.searchExa.handler({ query: 't3' });
+    assert(over.isError && over.content[0].text.includes('searchExa monthly budget exhausted (2/2)'), `tool cap: ${over.content[0].text}`);
+    assert(calls.length === 2 && getApiUsage().providers.exa.used === 2, 'over-cap call not sent or counted');
+    // fallback still has the shared cap
+    mode = 'degraded';
+    const r = await search('still-fallback');
+    assert(jsonOf(r.text).fallback === 'exa', 'fallback unaffected by tool cap');
+    delete process.env.EXA_TOOL_MONTHLY_LIMIT;
+    fresh(false, true);
+    process.env.EXA_MONTHLY_LIMIT = '1';
+    await tools.searchExa.handler({ query: 'u1' });
+    const over2 = await tools.searchExa.handler({ query: 'u2' });
+    assert(over2.isError && over2.content[0].text.includes('monthly budget exhausted (1/1)'), 'shared cap also binds the tool');
+    console.log('✅ searchExa own cap + shared exa cap');
+}
+
+async function testExaToolCacheAndInflight(): Promise<void> {
+    fresh(false, true);
+    const { tools } = makeTools();
+    await tools.searchExa.handler({ query: 'same' });
+    await tools.searchExa.handler({ query: 'same' });
+    assert(calls.length === 1, 'repeat searchExa served from cache');
+    await Promise.all([tools.searchExa.handler({ query: 'par' }), tools.searchExa.handler({ query: 'par' })]);
+    assert((calls as Req[]).length === 2, 'concurrent identical searchExa pays once');
+    fresh();
+    mode = 'degraded';
+    await Promise.all([search('pf'), search('pf'), search('pf')]);
+    assert(calls.length === 1 && getApiUsage().providers.brave.used === 1, `concurrent identical fallback pays once: ${calls.length}`);
+    console.log('✅ searchExa cache + in-flight dedupe');
+}
+
+async function testExaToolValidation(): Promise<void> {
+    fresh(false, true);
+    const { tools } = makeTools();
+    for (const bad of [{ startPublishedDate: 'not-a-date' }, { includeDomains: ['https://sec.gov'] }, { includeDomains: ['sec.gov/path'] }, { includeDomains: ['a b.com'] }]) {
+        const r = await tools.searchExa.handler({ query: 'v', ...bad });
+        assert(r.isError && /invalid/.test(r.content[0].text), `rejected ${JSON.stringify(bad)}: ${r.content[0].text}`);
+    }
+    assert(calls.length === 0 && getApiUsage().providers.exa.used === 0, 'invalid input neither sent nor counted');
+    const ok = await tools.searchExa.handler({ query: 'v', includeDomains: ['sec.gov', '*.example.com'], startPublishedDate: '2026-01-01' });
+    assert(!ok.isError, 'valid input passes');
+    console.log('✅ searchExa input validation');
+}
+
+async function testThrottleBraveOnly(): Promise<void> {
+    fresh();
+    mode = 'throttled';
+    handlers.brave = () => ({ status: 500, data: '' });
+    const r = await search('thr');
+    assert(calls.length === 1 && calls[0].url.includes('brave'), `throttle -> brave only, calls=${calls.map((c) => c.url)}`);
+    assert(r.isError && /brave: .*500/.test(r.text) && !/exa/.test(r.text), `error text: ${r.text}`);
+    fresh();
+    mode = 'throttled';
+    const ok = await search('thr2');
+    assert(!ok.isError && ok.text.startsWith(BRAVE_NOTE), 'brave serves throttled search');
+    mode = 'failure';
+    handlers.brave = () => ({ status: 500, data: '' });
+    fresh();
+    handlers.brave = () => ({ status: 500, data: '' });
+    await search('engine-fail');
+    assert(calls.some((c) => c.url.includes('exa')), 'engine failure may still use exa');
+    console.log('✅ queue throttle falls back to Brave only');
+}
+
+async function testExhaustionLogging(): Promise<void> {
+    fresh();
+    mode = 'degraded';
+    process.env.BRAVE_MONTHLY_LIMIT = '1';
+    const logs: string[] = [];
+    const orig = console.error;
+    console.error = (...a: unknown[]) => { logs.push(a.map(String).join(' ')); };
+    try {
+        await search('e1'); await search('e2'); await search('e3');
+    } finally {
+        console.error = orig;
+    }
+    assert(logs.filter((l) => l.includes('api budget exhausted for brave')).length === 1, 'one exhaustion line per month');
+    assert(logs.filter((l) => l.startsWith('[local-search] api {') && l.includes('"status":"over_budget"')).length === 2, 'over-budget goes through the api log line');
+    console.log('✅ exhaustion logging');
+}
+
 async function testStatusExposesUsage(): Promise<void> {
     fresh();
     const { runtime } = makeTools();
@@ -324,6 +462,13 @@ async function main(): Promise<void> {
     await testRedactionAndLogging();
     await testSearchExaTool();
     await testStatusExposesUsage();
+    await testConcurrentRateLimit();
+    await testFailClosedCounterFile();
+    await testExaToolCapsAndSharedCounter();
+    await testExaToolCacheAndInflight();
+    await testExaToolValidation();
+    await testThrottleBraveOnly();
+    await testExhaustionLogging();
     __setSearchApiHttpForTests();
     __setSearchApiClockForTests();
     rmSync(stateRoot, { recursive: true, force: true });
