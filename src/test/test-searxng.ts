@@ -331,6 +331,58 @@ async function testLoudRetryHardening(): Promise<void> {
     console.log('✅ loud degradation: retry errors, fail-fast, first page only, ordering');
 }
 
+async function testLoudRetryEdgeCases(): Promise<void> {
+    const baseCfg = () => { resetRotationConfig(); config.searxngRotateEngines = ['duckduckgo']; };
+    const pairOf = (o: any) => String(o.params.engines).split(',').find((e: string) => e.startsWith('duckduckgo '))!;
+
+    // T5a: idle service, default global min interval: a quick CAPTCHA still gets its retry
+    baseCfg();
+    config.searxngMinIntervalMs = 1000;
+    let t = 1_000_000;
+    __setSearxngClockForTests({ now: () => t, sleep: async (ms) => { t += ms; } });
+    let n = 0;
+    __setSearxngHttpGetForTests(async (_u, o) => {
+        n++; t += 300;
+        const p = pairOf(o);
+        return { status: 200, data: n === 1 ? { results: [wikiItem(1)], unresponsive_engines: [[p, 'CAPTCHA']] } : { results: [pairItem(7, p)] } } as any;
+    });
+    let d = await searchSearxngDetailed('t5a', 10);
+    assert((n as number) === 2 && !d.degraded, `short min-interval wait allowed for the retry: calls=${n} ${JSON.stringify(d.degraded)}`);
+    __setSearxngClockForTests();
+
+    // T5b: real timers, concurrency 1: agent B queued behind A is not delayed by A's optional retry
+    baseCfg();
+    config.searxngMaxConcurrency = 1;
+    config.searxngMinIntervalMs = 1000;
+    const order: string[] = [];
+    __setSearxngHttpGetForTests(async (_u, o) => {
+        const q = String((o.params as any).q);
+        const first = String((o.params as any).engines).includes('wikipedia');
+        order.push(`${q}:${first ? 'first' : 'retry'}`);
+        await new Promise((r) => setTimeout(r, 50));
+        const p = pairOf(o);
+        return { status: 200, data: q === 'A' && first ? { results: [wikiItem(1)], unresponsive_engines: [[p, 'CAPTCHA']] } : { results: [pairItem(q === 'A' ? 8 : 9, p), wikiItem(2)] } } as any;
+    });
+    const pa = searchSearxngDetailed('A', 10);
+    await new Promise((r) => setTimeout(r, 10));
+    const pb = searchSearxngDetailed('B', 10);
+    const [ra] = await Promise.all([pa, pb]);
+    assert(order.indexOf('B:first') < order.indexOf('A:retry') || !order.includes('A:retry'), `B not delayed by A's retry: ${order}`);
+    assert(ra.results.length >= 1, 'A still answered');
+
+    // T5e: recovered DDG whose only result duplicates an extras URL is not flagged degraded
+    baseCfg();
+    n = 0;
+    __setSearxngHttpGetForTests(async (_u, o) => {
+        n++;
+        const p = pairOf(o);
+        return { status: 200, data: n === 1 ? { results: [wikiItem(1)], unresponsive_engines: [[p, 'CAPTCHA']] } : { results: [pairItem(1, p)] } } as any;
+    });
+    d = await searchSearxngDetailed('t5e', 10);
+    assert((n as number) === 2 && !d.degraded && d.results.length === 1, `duplicate URL credited to the recovered engine: ${JSON.stringify(d.degraded)}`);
+    console.log('✅ loud degradation: short idle wait, queue not delayed, duplicate-URL recovery');
+}
+
 async function main(): Promise<void> {
     config.searxngUrl = 'http://127.0.0.1:8888/';
     config.searxngEngines = ['duckduckgo', 'brave'];
@@ -427,6 +479,7 @@ async function main(): Promise<void> {
     await testMaxPages();
     await testLoudDegradation();
     await testLoudRetryHardening();
+    await testLoudRetryEdgeCases();
 
     __setSearxngHttpGetForTests();
     __setSearxngClockForTests();

@@ -260,7 +260,11 @@ export class SearxngScheduler {
             throw new QueueFullError(queueDepth, o.maxQueueDepth, this.etaMs(queueDepth));
         }
         if (req.noWait) {
-            if (this.queue.length > 0 || this.plan(req, enqueuedAt).kind !== 'ready') throw new NoCapacityError();
+            // idle service only; a short wait (global min interval) is fine, a pair interval or a busy slot is not
+            const probe = this.queue.length > 0 ? undefined : this.plan(req, enqueuedAt);
+            const shortWait = probe?.kind === 'wait' && probe.waitMs > 0 && this.active < Math.max(1, o.maxConcurrency)
+                && probe.waitMs <= Math.max(o.minIntervalMs, 1500);
+            if (!probe || (probe.kind !== 'ready' && !shortWait)) throw new NoCapacityError();
         }
         const waited = () => clock.now() - enqueuedAt;
         const signal = req.signal;

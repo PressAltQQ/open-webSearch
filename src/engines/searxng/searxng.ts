@@ -200,8 +200,15 @@ function unresponsiveReason(raw: unknown[], engine: string): string | undefined 
 }
 
 function mergeBodies(first: SearxngBody, retry: SearxngBody): SearxngBody {
-    const results = asArray(first?.results) as SearxngRawResult[];
-    const extra = (asArray(retry?.results) as SearxngRawResult[]).filter((r) => !results.some((x) => x.url === r.url));
+    const results = (asArray(first?.results) as SearxngRawResult[]).map((r) => ({ ...r }));
+    const extra: SearxngRawResult[] = [];
+    for (const r of asArray(retry?.results) as SearxngRawResult[]) {
+        const same = results.find((x) => x.url === r.url);
+        if (!same) { extra.push(r); continue; }
+        // same URL from the rotated engine: keep one copy but credit both engines (health is judged on source)
+        const names = (x: SearxngRawResult) => x.engines?.length ? x.engines : (x.engine ? [x.engine] : []);
+        same.engines = [...new Set([...names(r), ...names(same)])];
+    }
     // rotated-engine results first: the final limit must not cut them while the answer is flagged healthy
     return { ...first, results: [...extra, ...results] };
 }
