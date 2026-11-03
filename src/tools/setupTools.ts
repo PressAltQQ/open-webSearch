@@ -15,6 +15,26 @@ import {
 import { OpenWebSearchRuntime } from '../runtime/runtimeTypes.js';
 export { normalizeEngineName };
 
+type SearchOutcome = Awaited<ReturnType<OpenWebSearchRuntime['services']['search']['execute']>>;
+
+// The model tends to read only the text start: a degraded answer must say so there, not only in JSON meta.
+function degradedWarning(degraded: NonNullable<SearchOutcome['degraded']>): string {
+    return `WARNING: primary web search engine unavailable (${degraded.reasons.join('; ')}); results below come only from the remaining engines (e.g. wikipedia/keenable) and may miss news, company and pricing pages. Retry later or use another search tool.`;
+}
+
+// Zero results because of a failure (not because nothing exists): fail loudly instead of an empty result.
+function zeroResultFailure(result: SearchOutcome): { content: Array<{ type: 'text'; text: string }>; isError: true } | undefined {
+    if (result.totalResults > 0 || (result.partialFailures.length === 0 && !result.degraded)) return undefined;
+    const reasons = [...new Set([...result.partialFailures.map((f) => f.message), ...(result.degraded?.reasons ?? [])])];
+    return {
+        content: [{
+            type: 'text',
+            text: `Search FAILED: ${reasons.join('; ')}. The search system failed; this does NOT mean the information does not exist. Retry later or use another search tool.`
+        }],
+        isError: true
+    };
+}
+
 // 获取工具名称，优先使用环境变量，否则使用默认值
 function getToolName(envVarName: string, defaultName: string): string {
     const configuredName = process.env[envVarName];
@@ -126,17 +146,22 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                     };
                 }
 
-                return {
-                    content: [{
-                        type: 'text',
-                        text: JSON.stringify({
+                const failed = zeroResultFailure(searchResult);
+                if (failed) return failed;
+
+                const json = JSON.stringify({
                             query: searchResult.query,
                             engines: searchResult.engines,
                             totalResults: searchResult.totalResults,
                             results: searchResult.results,
                             partialFailures: searchResult.partialFailures,
+                            ...(searchResult.degraded ? { degraded: true, degradedReasons: searchResult.degraded.reasons } : {}),
                             ...(searchResult.meta ? { meta: searchResult.meta } : {})
-                        }, null, 2)
+                        }, null, 2);
+                return {
+                    content: [{
+                        type: 'text',
+                        text: searchResult.degraded ? `${degradedWarning(searchResult.degraded)}\n\n${json}` : json
                     }]
                 };
             } catch (error) {
@@ -374,6 +399,8 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                             isError: true
                         };
                     }
+                    const failed = zeroResultFailure(searchResult);
+                    if (failed) return failed;
                     return {
                         content: [{
                             type: 'text' as const,
@@ -421,10 +448,7 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                 const successfulFetches = fetchedResults.filter(r => r.content !== null).length;
                 console.error(`[deepresearch] Fetched ${successfulFetches}/${fetchedResults.length} sources`);
 
-                return {
-                    content: [{
-                        type: 'text' as const,
-                        text: JSON.stringify({
+                const deepJson = JSON.stringify({
                             query,
                             totalResults: fetchedResults.length,
                             successfulFetches,
@@ -432,9 +456,14 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                             searchMeta: {
                                 engines: searchResult.engines,
                                 partialFailures: searchResult.partialFailures,
+                                ...(searchResult.degraded ? { degraded: true, degradedReasons: searchResult.degraded.reasons } : {}),
                                 ...(searchResult.meta ? { meta: searchResult.meta } : {})
                             }
-                        }, null, 2)
+                        }, null, 2);
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: searchResult.degraded ? `${degradedWarning(searchResult.degraded)}\n\n${deepJson}` : deepJson
                     }]
                 };
             } catch (error) {

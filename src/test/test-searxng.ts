@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { searchSearxng, __setSearxngHttpGetForTests, __setSearxngClockForTests, __resetSearxngStateForTests } from '../engines/searxng/searxng.js';
+import { searchSearxng, searchSearxngDetailed, __getSearxngSchedulerForTests, __setSearxngHttpGetForTests, __setSearxngClockForTests, __resetSearxngStateForTests } from '../engines/searxng/searxng.js';
 
 type Call = { url: string; params: Record<string, unknown>; proxy: unknown };
 const calls: Call[] = [];
@@ -177,6 +177,93 @@ async function testMaxPages(): Promise<void> {
     console.log('✅ max pages');
 }
 
+
+const pairItem = (n: number, pair: string) => item(n, { engine: pair, engines: [pair] });
+const wikiItem = (n: number) => item(n, { engine: 'wikipedia', engines: ['wikipedia'] });
+
+async function testLoudDegradation(): Promise<void> {
+    const baseCfg = () => { resetRotationConfig(); config.searxngRotateEngines = ['duckduckgo']; };
+
+    // mode 1: DDG captcha, extras deliver -> one retry on another egress; recovered -> not degraded
+    baseCfg();
+    mockPages([
+        { data: { results: [wikiItem(1)], unresponsive_engines: [['duckduckgo deck', 'CAPTCHA']] } },
+        { data: { results: [pairItem(2, 'duckduckgo vlabs')] } }
+    ]);
+    let d = await searchSearxngDetailed('m1', 10);
+    assert(calls.length === 2 && calls[1].params.engines === 'duckduckgo vlabs', `retried on another egress even with extras: ${calls.map(c => c.params.engines)}`);
+    assert(d.results.length === 2 && !d.degraded, `merged and healthy: ${d.results.length} ${JSON.stringify(d.degraded)}`);
+
+    // mode 1: retry fails too -> degraded with reason, results kept
+    baseCfg();
+    mockPages([
+        { data: { results: [wikiItem(1)], unresponsive_engines: [['duckduckgo deck', 'CAPTCHA']] } },
+        { data: { results: [], unresponsive_engines: [['duckduckgo vlabs', 'CAPTCHA']] } }
+    ]);
+    d = await searchSearxngDetailed('m1b', 10);
+    assert((calls.length as number) === 2 && d.results.length === 1, `one retry, extras kept: ${calls.length}`);
+    assert(d.degraded?.engines.join() === 'duckduckgo' && /duckduckgo.*CAPTCHA/.test(d.degraded.reasons.join()), `degraded: ${JSON.stringify(d.degraded)}`);
+
+    // degraded results are cached only briefly; healthy ones keep the full TTL
+    baseCfg();
+    config.searxngCacheTtlMs = 3_600_000;
+    let t = 1_000_000;
+    __setSearxngClockForTests({ now: () => t, sleep: async () => {} });
+    calls.length = 0;
+    __setSearxngHttpGetForTests(async (url, options) => {
+        const params = options.params as Record<string, unknown>;
+        calls.push({ url, params, proxy: options.proxy });
+        const pair = String(params.engines).split(',').find((e) => e.startsWith('duckduckgo '));
+        return { status: 200, data: { results: [wikiItem(1)], unresponsive_engines: [[pair, 'CAPTCHA']] } } as any;
+    });
+    await searchSearxngDetailed('cache-deg', 10);
+    const n = calls.length;
+    const hit = await searchSearxngDetailed('cache-deg', 10);
+    assert(calls.length === n && hit.degraded, 'degraded result served from cache within a minute, still flagged');
+    t += 61_000;
+    await searchSearxngDetailed('cache-deg', 10);
+    assert(calls.length > n, 'degraded cache entry expires after ~60s');
+    baseCfg();
+    config.searxngCacheTtlMs = 3_600_000;
+    mockPages(Array.from({ length: 4 }, (_, i) => ({ data: { results: [pairItem(i, 'duckduckgo deck')] } })));
+    await searchSearxngDetailed('cache-ok', 10);
+    t += 1_800_000;
+    await searchSearxngDetailed('cache-ok', 10);
+    assert((calls.length as number) === 1, 'healthy result keeps the full TTL');
+    __setSearxngClockForTests();
+
+    // mode 2: every DDG pair cooling, extras still deliver -> degraded, cooling reason
+    baseCfg();
+    const sched = __getSearxngSchedulerForTests();
+    for (const e of ['deck', 'vlabs', 'madrid']) sched.reportFailure('duckduckgo', e);
+    mockPages([{ data: { results: [wikiItem(1)] } }]);
+    d = await searchSearxngDetailed('m2', 10);
+    assert(d.results.length === 1 && d.degraded?.engines.join() === 'duckduckgo' && /cooling/.test(d.degraded.reasons.join()), `cooling degraded: ${JSON.stringify(d.degraded)}`);
+
+    // mode 3: >=5 results but DDG contributed none -> degraded
+    baseCfg();
+    mockPages(Array.from({ length: 2 }, () => ({ data: { results: [1, 2, 3, 4, 5].map(wikiItem) } })));
+    d = await searchSearxngDetailed('m3', 10);
+    assert(d.results.length === 5 && d.degraded?.engines.join() === 'duckduckgo' && /no results/.test(d.degraded.reasons.join()), `zero contribution degraded: ${JSON.stringify(d.degraded)}`);
+
+    // healthy + genuine zero results stay unflagged
+    baseCfg();
+    mockPages([{ data: { results: [pairItem(1, 'duckduckgo deck'), wikiItem(2)] } }]);
+    d = await searchSearxngDetailed('ok', 10);
+    assert(!d.degraded && d.partialFailures.length === 0, 'healthy is not degraded');
+    baseCfg();
+    mockPages([{ data: { results: [] } }]);
+    d = await searchSearxngDetailed('none', 10);
+    assert(!d.degraded && d.partialFailures.length === 0 && d.results.length === 0, 'genuine empty stays a plain empty result');
+
+    // compat-style single page: no extra retry when results exist
+    baseCfg();
+    mockPages([{ data: { results: [wikiItem(1)], unresponsive_engines: [['duckduckgo deck', 'CAPTCHA']] } }]);
+    await searchSearxngDetailed('compat', 10, { pageno: 1 });
+    assert((calls.length as number) === 1, 'single-page (compat) path keeps its retry-only-on-empty behaviour');
+    console.log('✅ loud degradation: retry, flag, short cache, no false alarms');
+}
+
 async function main(): Promise<void> {
     config.searxngUrl = 'http://127.0.0.1:8888/';
     config.searxngEngines = ['duckduckgo', 'brave'];
@@ -271,6 +358,7 @@ async function main(): Promise<void> {
     await testCache();
     await testConcurrencyAndInterval();
     await testMaxPages();
+    await testLoudDegradation();
 
     __setSearxngHttpGetForTests();
     __setSearxngClockForTests();

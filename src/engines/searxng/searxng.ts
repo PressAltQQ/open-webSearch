@@ -11,6 +11,8 @@ export { SchedulerBusyError, QueueTimeoutError, QueueFullError, AllPairsCoolingE
 const HARD_MAX_PAGES = 5;
 const CACHE_MAX_ENTRIES = 1000;
 const QUERY_LOG_MAX = 80;
+// A result set where the primary engine was missing is kept only this long, whatever the configured TTL.
+const DEGRADED_CACHE_TTL_MS = 60000;
 
 type HttpGet = (url: string, options: AxiosRequestConfig) => Promise<AxiosResponse>;
 
@@ -94,7 +96,11 @@ export interface SearxngDetailedResult {
     skipped: string[];
     /** raw `unresponsive_engines` entries, SearXNG-shaped */
     rawUnresponsive: unknown[];
+    /** set when a rotated primary engine did not contribute: results may be missing key sources */
+    degraded?: SearxngDegraded;
 }
+
+export type SearxngDegraded = { engines: string[]; reasons: string[] };
 
 export interface SearxngSearchOptions {
     /** fetch exactly this single page (compat endpoint); default is the configured multi-page loop */
@@ -146,6 +152,7 @@ interface PageData {
     unresponsive: string[];
     rawUnresponsive: unknown[];
     egress: Record<string, string>;
+    degraded?: SearxngDegraded;
 }
 
 function cacheGet(key: string): PageData | undefined {
@@ -164,6 +171,7 @@ function cacheSet(key: string, page: PageData): void {
     let ttl = config.searxngCacheTtlMs ?? 86400000;
     // a response where a requested engine was unresponsive/skipped is incomplete: keep it only briefly
     if (page.partial) ttl = Math.min(ttl, config.searxngPartialCacheTtlMs ?? 600000);
+    if (page.degraded) ttl = Math.min(ttl, DEGRADED_CACHE_TTL_MS);
     if (ttl <= 0 || page.mapped.length === 0) return;
     cache.delete(key);
     cache.set(key, { expires: clock.now() + ttl, page });
@@ -178,6 +186,18 @@ function unresponsiveNames(list: unknown[]): string[] {
 
 function contributed(results: SearxngRawResult[], pairName: string): boolean {
     return results.some((r) => r.engine === pairName || r.engines?.includes(pairName));
+}
+
+function unresponsiveReason(raw: unknown[], engine: string): string | undefined {
+    const hit = raw.find((item) => String(Array.isArray(item) ? item[0] : item).startsWith(`${engine} `));
+    const msg = Array.isArray(hit) ? hit[1] : undefined;
+    return typeof msg === 'string' && msg ? msg : undefined;
+}
+
+function mergeBodies(first: SearxngBody, retry: SearxngBody): SearxngBody {
+    const results = asArray(first?.results) as SearxngRawResult[];
+    const extra = (asArray(retry?.results) as SearxngRawResult[]).filter((r) => !results.some((x) => x.url === r.url));
+    return { ...first, results: [...results, ...extra] };
 }
 
 const asArray = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
@@ -239,6 +259,7 @@ export async function searchSearxngDetailed(query: string, limit: number, option
     let fetchedPages = 0;
     let upstreamCalls = 0;
     let failure: unknown;
+    const degradedAll: SearxngDegraded = { engines: [], reasons: [] };
 
     const upstream = async (pageno: number, enginesParam: string | undefined): Promise<SearxngBody> => {
         const params: Record<string, string | number> = { q: query, format: 'json', pageno };
@@ -377,6 +398,7 @@ export async function searchSearxngDetailed(query: string, limit: number, option
         let unresponsive: string[];
         let rawUnresponsive: unknown[];
         let partial: boolean;
+        let degraded: SearxngDegraded | undefined;
         if (rotationOn) {
             const first = await scheduledCall(pageno, rotated, extras, 'first', pageFailures);
             first.picks.forEach((e, engine) => { egress[engine] = e; });
@@ -384,20 +406,34 @@ export async function searchSearxngDetailed(query: string, limit: number, option
             unresponsive = first.unresponsive;
             rawUnresponsive = first.rawUnresponsive;
             partial = first.failed.length > 0 || pageFailures.length > 0 || first.unresponsive.length > 0;
-            if (asArray(body?.results).length === 0 && first.failed.length > 0) {
+            let stillFailed = first.failed;
+            // With results already in hand the retry is for completeness only (extras-only answers miss the
+            // primary engine); the single-page compat path keeps the old retry-only-on-empty behaviour.
+            if (first.failed.length > 0 && (asArray(body?.results).length === 0 || !singlePage)) {
                 // At most one retry, for the failed engines only, through the scheduler with a different
                 // healthy pair (it respects pair interval and global limits). If nothing can be scheduled
                 // within the remaining budget we fall through to the readable "unresponsive" error.
                 try {
                     const retry = await scheduledCall(pageno, first.failed, [], 'retry', pageFailures);
                     retry.picks.forEach((e, engine) => { egress[engine] = e; });
-                    body = retry.body;
+                    body = asArray(body?.results).length === 0 ? retry.body : mergeBodies(body, retry.body);
+                    stillFailed = retry.failed;
                     unresponsive = [...first.unresponsive, ...retry.unresponsive];
                     rawUnresponsive = [...first.rawUnresponsive, ...retry.rawUnresponsive];
                 } catch (error) {
                     if (!(error instanceof SchedulerBusyError)) throw error;
                     console.error(`[local-search] retry not possible: ${error.message}`);
                 }
+            }
+            const cooling = pageFailures.map((f) => f.engine).filter((e) => rotated.includes(e));
+            const engines = [...new Set([...stillFailed, ...cooling])];
+            if (engines.length > 0) {
+                degraded = {
+                    engines,
+                    reasons: engines.map((e) => `${e}: ${cooling.includes(e) && !stillFailed.includes(e)
+                        ? 'all egress pairs cooling down'
+                        : (unresponsiveReason(rawUnresponsive, e) ?? 'returned no results')}`)
+                };
             }
         } else {
             const call = await scheduledCall(pageno, [], fixedEngines, 'first', pageFailures);
@@ -437,7 +473,8 @@ export async function searchSearxngDetailed(query: string, limit: number, option
             partialFailures: pageFailures,
             unresponsive,
             rawUnresponsive,
-            egress
+            egress,
+            ...(degraded ? { degraded } : {})
         };
         cacheSet(cacheKey, page);
         return { page, hit: false };
@@ -462,6 +499,8 @@ export async function searchSearxngDetailed(query: string, limit: number, option
             for (const name of page.unresponsive) if (!meta.unresponsive.includes(name)) meta.unresponsive.push(name);
             partialFailures.push(...page.partialFailures);
             rawUnresponsiveLast = page.rawUnresponsive;
+            for (const e of page.degraded?.engines ?? []) if (!degradedAll.engines.includes(e)) degradedAll.engines.push(e);
+            for (const r of page.degraded?.reasons ?? []) if (!degradedAll.reasons.includes(r)) degradedAll.reasons.push(r);
             if (pageno === firstPage) extrasOut = page.extras;
             rawCollected.push(...page.raw);
 
@@ -504,7 +543,8 @@ export async function searchSearxngDetailed(query: string, limit: number, option
         meta,
         partialFailures,
         skipped: partialFailures.filter((f) => f.engine !== 'searxng').map((f) => f.engine),
-        rawUnresponsive: rawUnresponsiveLast
+        rawUnresponsive: rawUnresponsiveLast,
+        ...(degradedAll.engines.length > 0 ? { degraded: degradedAll } : {})
     };
 }
 
@@ -514,6 +554,6 @@ export async function searchSearxng(
     context?: SearchExecutionContext
 ): Promise<SearchResult[]> {
     const detailed = await searchSearxngDetailed(query, limit);
-    context?.report?.({ meta: detailed.meta, partialFailures: detailed.partialFailures });
+    context?.report?.({ meta: detailed.meta, partialFailures: detailed.partialFailures, degraded: detailed.degraded });
     return detailed.results;
 }
