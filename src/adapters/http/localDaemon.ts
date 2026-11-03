@@ -4,6 +4,7 @@ import { AppConfig } from '../../config.js';
 import { OpenWebSearchRuntime } from '../../runtime/runtimeTypes.js';
 import { createErrorEnvelope, createSuccessEnvelope } from '../../cli/protocol.js';
 import { normalizeEngineName, resolveRequestedEngines, SupportedSearchEngine } from '../../core/search/searchEngines.js';
+import { getApiUsage, type ApiUsage } from '../../engines/searchApis/searchApis.js';
 import { shutdownLocalPlaywrightBrowserSessions } from '../../utils/playwrightClient.js';
 
 export type LocalDaemonOptions = {
@@ -26,6 +27,8 @@ export type LocalDaemonStatus = {
         useProxy: boolean;
         fetchWebAllowInsecureTls: boolean;
     };
+    /** key-based search API budgets (Brave/Exa fallbacks); never includes keys */
+    searchApis: ApiUsage;
 };
 
 export type LocalDaemonHandle = {
@@ -169,7 +172,8 @@ export async function startLocalDaemon(
             searchMode: runtime.config.searchMode,
             useProxy: runtime.config.useProxy,
             fetchWebAllowInsecureTls: runtime.config.fetchWebAllowInsecureTls
-        }
+        },
+        searchApis: getApiUsage()
     });
 
     app.get('/health', (_req, res) => {
