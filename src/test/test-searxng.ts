@@ -242,7 +242,8 @@ async function testLoudDegradation(): Promise<void> {
 
     // mode 3: >=5 results but DDG contributed none -> degraded
     baseCfg();
-    mockPages(Array.from({ length: 2 }, () => ({ data: { results: [1, 2, 3, 4, 5].map(wikiItem) } })));
+    // DDG silently contributes nothing (not reported unresponsive); the DDG-only retry realistically returns nothing too
+    mockPages([{ data: { results: [1, 2, 3, 4, 5].map(wikiItem) } }, { data: { results: [] } }]);
     d = await searchSearxngDetailed('m3', 10);
     assert(d.results.length === 5 && d.degraded?.engines.join() === 'duckduckgo' && /no results/.test(d.degraded.reasons.join()), `zero contribution degraded: ${JSON.stringify(d.degraded)}`);
 
@@ -262,6 +263,72 @@ async function testLoudDegradation(): Promise<void> {
     await searchSearxngDetailed('compat', 10, { pageno: 1 });
     assert((calls.length as number) === 1, 'single-page (compat) path keeps its retry-only-on-empty behaviour');
     console.log('✅ loud degradation: retry, flag, short cache, no false alarms');
+}
+
+async function testLoudRetryHardening(): Promise<void> {
+    const baseCfg = () => { resetRotationConfig(); config.searxngRotateEngines = ['duckduckgo']; };
+    const captcha = (pair = 'duckduckgo deck') => ({ results: [wikiItem(1), wikiItem(2)], unresponsive_engines: [[pair, 'CAPTCHA']] });
+
+    // T1: a failing completeness retry keeps the first call's results and reports why
+    baseCfg();
+    mockPages([{ data: captcha() }, { status: 502, data: '' }]);
+    let d = await searchSearxngDetailed('t1a', 10);
+    assert(d.results.length === 2 && d.degraded && /retry failed.*HTTP 502/.test(d.degraded.reasons.join()), `retry 502 keeps results: ${JSON.stringify(d.degraded)}`);
+    baseCfg();
+    calls.length = 0;
+    __setSearxngHttpGetForTests(async () => {
+        if (calls.push({ url: '', params: {}, proxy: false }) === 1) return { status: 200, data: captcha() } as any;
+        throw new Error('timeout of 3000ms exceeded');
+    });
+    d = await searchSearxngDetailed('t1b', 10);
+    assert(d.results.length === 2 && d.degraded && /retry failed.*timeout/.test(d.degraded.reasons.join()), `retry timeout keeps results: ${JSON.stringify(d.degraded)}`);
+
+    // T2: with no free pair the completeness retry fails fast instead of waiting at the head of the queue
+    baseCfg();
+    config.searxngPairMinIntervalMs = 10000;
+    config.searxngQueueTimeoutMs = 45000;
+    let t = 1_000_000;
+    const sleeps: number[] = [];
+    __setSearxngClockForTests({ now: () => t, sleep: async (ms) => { sleeps.push(ms); t += ms; } });
+    const pairOf = (o: any) => String(o.params.engines).split(',').find((e: string) => e.startsWith('duckduckgo '))!;
+    __setSearxngHttpGetForTests(async (_u, o) => ({ status: 200, data: { results: [pairItem(1, pairOf(o)), wikiItem(1)] } } as any));
+    await searchSearxngDetailed('o1', 10);
+    await searchSearxngDetailed('o2', 10);
+    t += 1000;
+    sleeps.length = 0;
+    let n = 0;
+    __setSearxngHttpGetForTests(async (_u, o) => {
+        n++;
+        return { status: 200, data: n === 1 ? captcha(pairOf(o)) : { results: [pairItem(5, pairOf(o))] } } as any;
+    });
+    d = await searchSearxngDetailed('t2', 10);
+    assert(n === 1 && sleeps.length === 0 && d.meta.queued_ms === 0, `retry did not wait: calls=${n} sleeps=${JSON.stringify(sleeps)} queued=${d.meta.queued_ms}`);
+    assert(d.results.length === 2 && d.degraded, 'degraded results returned immediately');
+    __setSearxngClockForTests();
+
+    // T3: completeness retry only on the first page
+    baseCfg();
+    config.searxngMaxPages = 3;
+    n = 0;
+    __setSearxngHttpGetForTests(async (_u, o) => {
+        n++;
+        const params = o.params as Record<string, any>;
+        const pair = String(params.engines).split(',').find((e) => e.startsWith('duckduckgo '))!;
+        const ext = String(params.engines).includes('wikipedia');
+        return { status: 200, data: { results: ext ? [1, 2, 3, 4, 5].map((i) => wikiItem(params.pageno * 10 + i)) : [], unresponsive_engines: [[pair, 'CAPTCHA']] } } as any;
+    });
+    d = await searchSearxngDetailed('t3', 30);
+    assert((n as number) === 4, `1 retry (page 1 only) + 3 first calls, got ${n}`);
+
+    // T4: retry results come first, so the limit cannot cut them and still report healthy
+    baseCfg();
+    mockPages([
+        { data: { results: [1, 2, 3, 4, 5].map(wikiItem), unresponsive_engines: [['duckduckgo deck', 'CAPTCHA']] } },
+        { data: { results: [1, 2, 3].map((i) => pairItem(i + 100, 'duckduckgo vlabs')) } }
+    ]);
+    d = await searchSearxngDetailed('t4', 5);
+    assert(d.results.slice(0, 3).every((r) => r.source.startsWith('duckduckgo')) && !d.degraded, `rotated results first: ${d.results.map((r) => r.title)}`);
+    console.log('✅ loud degradation: retry errors, fail-fast, first page only, ordering');
 }
 
 async function main(): Promise<void> {
@@ -359,6 +426,7 @@ async function main(): Promise<void> {
     await testConcurrencyAndInterval();
     await testMaxPages();
     await testLoudDegradation();
+    await testLoudRetryHardening();
 
     __setSearxngHttpGetForTests();
     __setSearxngClockForTests();

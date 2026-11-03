@@ -29,6 +29,8 @@ export interface AcquireRequest {
     timeoutMs: number;
     /** abort a queued request (e.g. the client went away): it leaves the queue without being served */
     signal?: AbortSignal;
+    /** optional work: fail at once (NoCapacityError) instead of queueing or sleeping for a slot/pair */
+    noWait?: boolean;
 }
 
 export interface SkippedEngine {
@@ -82,6 +84,14 @@ export class AllPairsCoolingError extends SchedulerBusyError {
     constructor(retryInMs: number, waitedMs: number) {
         super(`local-search: all upstream engine/egress pairs are cooling down after errors (earliest recovery in ${sec(retryInMs)}s); retry in ~${sec(retryInMs)}s, do not retry immediately`, sec(retryInMs), waitedMs);
         this.name = 'AllPairsCoolingError';
+    }
+}
+
+/** A no-wait request found no free slot/pair right now (or others are queued). */
+export class NoCapacityError extends SchedulerBusyError {
+    constructor() {
+        super('local-search: no free slot or healthy pair right now (optional retry skipped)', 1, 0);
+        this.name = 'NoCapacityError';
     }
 }
 
@@ -167,6 +177,12 @@ export class SearxngScheduler {
         return { pair: key, level: s.failures, until: s.cooldownUntil };
     }
 
+    /** Number of pairs of this engine that are not cooling down right now. */
+    healthyPairCount(engine: string, egresses: string[]): number {
+        const now = this.clock().now();
+        return egresses.filter((e) => (this.pairs.get(this.pairKey(engine, e))?.cooldownUntil ?? 0) <= now).length;
+    }
+
     /** Time until the earliest cooling pair of these engines recovers (0 if none is cooling). */
     earliestRecoveryMs(engines: string[], egresses: string[]): number {
         const now = this.clock().now();
@@ -242,6 +258,9 @@ export class SearxngScheduler {
         const o = this.options();
         if (queueDepth >= Math.max(1, o.maxQueueDepth)) {
             throw new QueueFullError(queueDepth, o.maxQueueDepth, this.etaMs(queueDepth));
+        }
+        if (req.noWait) {
+            if (this.queue.length > 0 || this.plan(req, enqueuedAt).kind !== 'ready') throw new NoCapacityError();
         }
         const waited = () => clock.now() - enqueuedAt;
         const signal = req.signal;
