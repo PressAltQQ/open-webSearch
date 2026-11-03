@@ -512,12 +512,91 @@ function testConfigDrivenEngineSelectionAndMode(): void {
     console.log('✅ MCP config-driven engine and mode behavior remains compatible');
 }
 
+type ToolResponse = { content: Array<{ text: string }>; isError?: boolean };
+
+function toolsFor(bing: (query: string, limit: number, context?: any) => Promise<any[]>): Record<string, { handler: (input: unknown) => Promise<ToolResponse> }> {
+    const runtime = createOpenWebSearchRuntime({
+        dependencies: {
+            searchExecutors: { bing },
+            fetchGithubReadme: async () => '# README',
+            fetchWebContent: async (url) => ({
+                url, finalUrl: url, contentType: 'text/plain', title: 'Example', retrievalMethod: 'request' as const,
+                truncated: false, content: 'page', readabilityApplied: false
+            }),
+            fetchCsdnArticle: async () => ({ content: 'csdn' }),
+            fetchJuejinArticle: async () => ({ content: 'juejin' }),
+            fetchLinuxDoArticle: async () => ({ content: 'linuxdo' })
+        }
+    });
+    const server = new McpServer({ name: 'test', version: '1.0.0' });
+    setupTools(server, runtime);
+    return (server as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<ToolResponse> }> })._registeredTools;
+}
+
+const oneResult = [{ title: 'R', url: 'https://example.com', description: 'd', source: 's', engine: 'bing' }];
+const degradedInfo = { engines: ['duckduckgo'], reasons: ['duckduckgo: CAPTCHA'] };
+
+async function testLoudSearchFailures(): Promise<void> {
+    // degraded: the model-visible text starts with a warning, the JSON carries a machine-readable flag
+    let tools = toolsFor(async (_q, _l, ctx) => { ctx.report({ degraded: degradedInfo }); return oneResult; });
+    let res = await tools.search.handler({ query: 'q', engines: ['bing'] });
+    assert(!res.isError, 'degraded results are still a success');
+    assert(res.content[0].text.startsWith('WARNING: primary web search engine unavailable (duckduckgo: CAPTCHA)'), `warning first: ${res.content[0].text.slice(0, 120)}`);
+    assert(res.content[0].text.split('\n')[0].includes('Retry later'), 'warning is one line with advice');
+    const payload = parseJsonBlock(res.content[0].text) as { degraded: boolean; degradedReasons: string[]; totalResults: number };
+    assertEqual(payload.totalResults, 1, 'degraded payload keeps results');
+    assert(payload.degraded === true && payload.degradedReasons[0] === 'duckduckgo: CAPTCHA', 'degraded flag and reasons in JSON');
+
+    // healthy: no warning
+    tools = toolsFor(async () => oneResult);
+    res = await tools.search.handler({ query: 'q', engines: ['bing'] });
+    assert(res.content[0].text.startsWith('{') && !res.isError, 'healthy result has no warning');
+
+    // engine failure with zero results -> isError, explicit "does not mean no information"
+    tools = toolsFor(async () => { throw new Error('SearXNG returned HTTP 502'); });
+    res = await tools.search.handler({ query: 'q', engines: ['bing'] });
+    assert(res.isError === true && /Search FAILED/.test(res.content[0].text) && /HTTP 502/.test(res.content[0].text) && /does NOT mean/.test(res.content[0].text), `failure isError: ${res.content[0].text}`);
+
+    // degraded engine, zero results (e.g. all pairs cooling + extras empty)
+    tools = toolsFor(async (_q, _l, ctx) => {
+        ctx.report({ degraded: degradedInfo, partialFailures: [{ engine: 'duckduckgo', code: 'engine_degraded', message: 'duckduckgo: all egress pairs are cooling down' }] });
+        return [];
+    });
+    res = await tools.search.handler({ query: 'q', engines: ['bing'] });
+    assert(res.isError === true && /cooling down/.test(res.content[0].text) && /does NOT mean/.test(res.content[0].text), `degraded empty isError: ${res.content[0].text}`);
+
+    // genuine empty result from healthy engines stays a normal empty result
+    tools = toolsFor(async () => []);
+    res = await tools.search.handler({ query: 'q', engines: ['bing'] });
+    assert(!res.isError && !res.content[0].text.includes('WARNING'), 'genuine empty is not an alarm');
+    console.log('✅ search tool: loud degradation and failures');
+}
+
+async function testLoudDeepResearchFailures(): Promise<void> {
+    let tools = toolsFor(async () => { throw new Error('SearXNG request failed: ECONNREFUSED'); });
+    let res = await tools.deepresearch.handler({ query: 'q', engines: ['bing'] });
+    assert(res.isError === true && /ECONNREFUSED/.test(res.content[0].text) && /does NOT mean/.test(res.content[0].text), `deepresearch failure propagated: ${res.content[0].text}`);
+
+    tools = toolsFor(async (_q, _l, ctx) => { ctx.report({ degraded: degradedInfo }); return oneResult; });
+    res = await tools.deepresearch.handler({ query: 'q', engines: ['bing'] });
+    assert(res.content[0].text.startsWith('WARNING: primary web search engine unavailable'), 'deepresearch warns when degraded');
+    const payload = parseJsonBlock(res.content[0].text) as { searchMeta: { degraded: boolean } };
+    assert(payload.searchMeta.degraded === true, 'deepresearch exposes degraded');
+
+    tools = toolsFor(async () => []);
+    res = await tools.deepresearch.handler({ query: 'q', engines: ['bing'] });
+    assert(!res.isError && /No search results found/.test(res.content[0].text), 'genuine empty keeps the plain message');
+    console.log('✅ deepresearch: failures and degradation propagate');
+}
+
 async function main(): Promise<void> {
     await testSearchToolReturnsCompatiblePayload();
     await testSetupToolsUsesRuntimeConfigDefaults();
     await testSearchToolPassesSearchModeOverride();
     await testSearchToolAutoModeUsesRuntimeDefault();
     await testFetchWebToolPassesReadabilityFlags();
+    await testLoudSearchFailures();
+    await testLoudDeepResearchFailures();
     testCustomToolNamesAndFallbacks();
     testConfigDrivenEngineSelectionAndMode();
     console.log('\nMCP adapter tests passed.');

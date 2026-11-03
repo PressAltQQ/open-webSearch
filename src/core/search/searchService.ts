@@ -10,10 +10,12 @@ export type SearchExecutionFailure = {
     retryAfterSec?: number;
 };
 
+export type SearchDegraded = { engines: string[]; reasons: string[] };
+
 export type SearchExecutionContext = {
     searchMode?: AppConfig['searchMode'];
     /** engines may report diagnostics (timings, egress, degraded sub-engines) alongside results */
-    report?: (info: { meta?: Record<string, unknown>; partialFailures?: SearchExecutionFailure[] }) => void;
+    report?: (info: { meta?: Record<string, unknown>; partialFailures?: SearchExecutionFailure[]; degraded?: SearchDegraded }) => void;
 };
 
 export type SearchEngineExecutor = (query: string, limit: number, context?: SearchExecutionContext) => Promise<SearchResult[]>;
@@ -26,6 +28,8 @@ export type SearchExecutionResult = {
     results: SearchResult[];
     partialFailures: SearchExecutionFailure[];
     meta?: Record<string, unknown>;
+    /** a primary engine did not contribute: results are incomplete (see reasons) */
+    degraded?: SearchDegraded;
 };
 
 export type SearchExecutionInput = {
@@ -51,9 +55,16 @@ export function createSearchService(engineMap: SearchEngineExecutorMap) {
             const limits = distributeLimit(limit, engines.length);
             const partialFailures: SearchExecutionFailure[] = [];
             let meta: Record<string, unknown> | undefined;
+            let degraded: SearchDegraded | undefined;
             const report: NonNullable<SearchExecutionContext['report']> = (info) => {
                 if (info.meta) meta = { ...meta, ...info.meta };
                 if (info.partialFailures) partialFailures.push(...info.partialFailures);
+                if (info.degraded) {
+                    degraded = {
+                        engines: [...new Set([...(degraded?.engines ?? []), ...info.degraded.engines])],
+                        reasons: [...(degraded?.reasons ?? []), ...info.degraded.reasons]
+                    };
+                }
             };
             const effectiveSearchMode = resolveSearchModeOverride(searchMode);
 
@@ -93,7 +104,8 @@ export function createSearchService(engineMap: SearchEngineExecutorMap) {
                 totalResults: results.length,
                 results,
                 partialFailures,
-                ...(meta ? { meta } : {})
+                ...(meta ? { meta } : {}),
+                ...(degraded ? { degraded } : {})
             };
         }
     };
