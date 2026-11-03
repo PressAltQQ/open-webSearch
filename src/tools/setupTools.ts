@@ -13,19 +13,22 @@ import {
     validatePublicWebUrl
 } from '../core/validation/targetValidation.js';
 import { OpenWebSearchRuntime } from '../runtime/runtimeTypes.js';
+import { exaEnabled, searchExaTool, searchWithFallback, type FallbackOutcome } from '../engines/searchApis/searchApis.js';
 export { normalizeEngineName };
 
 type SearchOutcome = Awaited<ReturnType<OpenWebSearchRuntime['services']['search']['execute']>>;
 
 // The model tends to read only the text start: a degraded answer must say so there, not only in JSON meta.
-function degradedWarning(degraded: NonNullable<SearchOutcome['degraded']>): string {
-    return `WARNING: primary web search engine unavailable (${degraded.reasons.join('; ')}); results below come only from the remaining engines (e.g. wikipedia/keenable) and may miss news, company and pricing pages. Retry later or use another search tool.`;
+function degradedWarning(degraded: NonNullable<SearchOutcome['degraded']>, fallbackFailures: string[] = []): string {
+    const reasons = fallbackFailures.length > 0 ? [...degraded.reasons, `fallback failed - ${fallbackFailures.join(', ')}`] : degraded.reasons;
+    return `WARNING: primary web search engine unavailable (${reasons.join('; ')}); results below come only from the remaining engines (e.g. wikipedia/keenable) and may miss news, company and pricing pages. Retry later or use another search tool.`;
 }
 
 // Zero results because of a failure (not because nothing exists): fail loudly instead of an empty result.
-function zeroResultFailure(result: SearchOutcome): { content: Array<{ type: 'text'; text: string }>; isError: true } | undefined {
+function zeroResultFailure(result: SearchOutcome, fallbackFailures: string[] = []): { content: Array<{ type: 'text'; text: string }>; isError: true } | undefined {
     if (result.totalResults > 0 || (result.partialFailures.length === 0 && !result.degraded)) return undefined;
     const reasons = [...new Set([...result.partialFailures.map((f) => f.message), ...(result.degraded?.reasons ?? [])])];
+    if (fallbackFailures.length > 0) reasons.push(`fallback failed - ${fallbackFailures.join(', ')}`);
     return {
         content: [{
             type: 'text',
@@ -138,15 +141,42 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
 
                 // Queue timeout / queue full / all pairs cooling: nothing was searched, tell the agent plainly
                 // (isError) instead of returning an empty result that looks like "no information exists".
+                // Degraded or failed SearXNG answers may be topped up by a key-based API (Brave, then Exa).
+                // Healthy searches never reach this branch, so they never spend paid budget.
+                let fallback: FallbackOutcome | undefined;
+                const needsFallback = searchResult.engines.includes('searxng')
+                    && (searchResult.degraded !== undefined || (searchResult.totalResults === 0 && searchResult.partialFailures.length > 0));
+                if (needsFallback) fallback = await searchWithFallback(query, limit);
+                const fallbackFailures = fallback?.failures ?? [];
+
+                if (fallback?.provider) {
+                    const seen = new Set<string>();
+                    const merged = [...fallback.results, ...searchResult.results].filter((r) => !seen.has(r.url) && seen.add(r.url)).slice(0, limit);
+                    const reasons = searchResult.degraded?.reasons ?? searchResult.partialFailures.map((f) => f.message);
+                    const fbJson = JSON.stringify({
+                        query: searchResult.query,
+                        engines: searchResult.engines,
+                        totalResults: merged.length,
+                        results: merged,
+                        partialFailures: searchResult.partialFailures,
+                        fallback: fallback.provider,
+                        degradedReasons: reasons,
+                        ...(searchResult.meta ? { meta: searchResult.meta } : {})
+                    }, null, 2);
+                    return { content: [{ type: 'text', text: `NOTE: primary engine unavailable; results from ${fallback.provider} fallback.\n\n${fbJson}` }] };
+                }
+
                 const busy = searchResult.partialFailures.filter((f) => f.retryAfterSec !== undefined);
                 if (searchResult.totalResults === 0 && busy.length > 0 && busy.length === searchResult.partialFailures.length) {
+                    const lines = busy.map((f) => f.message);
+                    if (fallbackFailures.length > 0) lines.push(`fallback failed - ${fallbackFailures.join(', ')}`);
                     return {
-                        content: [{ type: 'text', text: busy.map((f) => f.message).join('\n') }],
+                        content: [{ type: 'text', text: lines.join('\n') }],
                         isError: true
                     };
                 }
 
-                const failed = zeroResultFailure(searchResult);
+                const failed = zeroResultFailure(searchResult, fallbackFailures);
                 if (failed) return failed;
 
                 const json = JSON.stringify({
@@ -161,7 +191,7 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
                 return {
                     content: [{
                         type: 'text',
-                        text: searchResult.degraded ? `${degradedWarning(searchResult.degraded)}\n\n${json}` : json
+                        text: searchResult.degraded ? `${degradedWarning(searchResult.degraded, fallbackFailures)}\n\n${json}` : json
                     }]
                 };
             } catch (error) {
@@ -176,6 +206,31 @@ export const setupTools = (server: McpServer, runtime: OpenWebSearchRuntime): vo
             }
         }
     );
+
+    // Explicit Exa search: only registered when a key is configured; every call spends monthly budget.
+    if (exaEnabled()) {
+        server.tool(
+            'searchExa',
+            'Exa neural search, best for finding primary sources (company pages, official announcements, filings, papers). Costs budget (hard monthly cap) - use when regular search misses the primary source.',
+            {
+                query: z.string().min(1, 'Search query must not be empty'),
+                numResults: z.number().int().min(1).max(10).default(8),
+                includeDomains: z.array(z.string().min(1)).optional(),
+                startPublishedDate: z.string().optional().describe('ISO 8601 date-time; only results published after it')
+            },
+            async ({ query, numResults = 8, includeDomains, startPublishedDate }) => {
+                try {
+                    const results = await searchExaTool(query, { numResults, includeDomains, startPublishedDate });
+                    return { content: [{ type: 'text', text: JSON.stringify({ query, provider: 'exa', totalResults: results.length, results }, null, 2) }] };
+                } catch (error) {
+                    return {
+                        content: [{ type: 'text', text: `searchExa failed: ${error instanceof Error ? error.message : 'Unknown error'}` }],
+                        isError: true
+                    };
+                }
+            }
+        );
+    }
 
     // 获取 Linux.do 文章工具
     server.tool(

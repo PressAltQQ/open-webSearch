@@ -195,6 +195,10 @@ npx cross-env DEFAULT_SEARCH_ENGINE=duckduckgo ENABLE_CORS=true open-websearch
 | `FETCH_MAX_CONCURRENCY` | `4` | Integer >= 1 | Max simultaneous page fetches overall |
 | `FETCH_QUEUE_TIMEOUT_MS` | `30000` | Integer >= 1 | Max wait in the fetch queue before the fetch fails with `fetch queue wait exceeded` |
 | `SEARXNG_MAX_PAGES` | `1` | 1-5 | Max result pages fetched per search |
+| `BRAVE_SEARCH_API_KEY` | empty (provider off) | Brave Search API key | Enables the Brave fallback (see "Paid API fallbacks"). Env only; never logged |
+| `EXA_API_KEY` | empty (provider off) | Exa API key | Enables the Exa fallback and the `searchExa` tool. Env only; never logged |
+| `BRAVE_MONTHLY_LIMIT` | `900` | Integer >= 0 | Hard cap of Brave requests per calendar month (UTC); counted before sending |
+| `EXA_MONTHLY_LIMIT` | `1500` | Integer >= 0 | Hard cap of Exa requests per calendar month (UTC); counted before sending |
 | `SEARCH_MODE` | `auto` | `request`, `auto`, `playwright` | Search strategy. Currently only affects Bing: request only, request then Playwright fallback, or force Playwright |
 | `PLAYWRIGHT_PACKAGE` | `auto` | `auto`, `playwright`, `playwright-core` | Which Playwright client package to resolve when browser mode is enabled |
 | `PLAYWRIGHT_MODULE_PATH` | empty | Absolute path or project-relative path | Reuse an existing Playwright client package outside this project |
@@ -678,6 +682,29 @@ Response example:
     "content": "🚀 开源 AI 联网搜索工具：Open-WebSearch MCP 全新升级，支持多引擎 + 流式响应..."
   }
 ]
+```
+
+## Paid API fallbacks (Brave, Exa)
+
+Optional, key-based, off by default (no key = behaviour identical to before). They run only in the MCP `search` path, only when a `searxng` search is degraded (primary engine unavailable after the retry) or failed with zero results, so healthy searches never call them. Order: Brave, then Exa (`type: "lite"`, the cheapest, no page contents requested). Results are placed first and deduplicated by URL. If a fallback delivered at least one result the answer starts with `NOTE: primary engine unavailable; results from <brave|exa> fallback.` and the JSON gets `fallback` (plus `degradedReasons`); no `WARNING`. If all fail, the `WARNING` / `isError` text is unchanged with the fallback failure reasons appended. The `:8888` compat endpoint never uses them. Fallback answers are cached per query (TTL `SEARXNG_CACHE_TTL_MS`), so repeats cost nothing.
+
+- Budget: request counters per provider and calendar month (UTC) in `$XDG_STATE_HOME/open-websearch/api-usage.json` (default `~/.local/state/...`), written atomically and kept across restarts. Over budget the provider is skipped with `monthly budget exhausted (N/M)`. Usage is in `open-websearch status` (`searchApis`). Each paid call logs `[local-search] api {provider, query, status, ms, used, limit}`.
+- Rate limit: Brave at most 1 request/s, Exa 5 requests/s (client side).
+- `searchExa` tool (registered only with `EXA_API_KEY`): neural `auto` search for primary sources, `query`, `numResults` (default 8, max 10), `includeDomains`, `startPublishedDate`; each call spends Exa budget.
+- Pricing (checked 2026-11-03): Brave Search API $5 per 1,000 requests with $5 free credit per month, so the default 900 stays inside it ([brave.com/search/api](https://brave.com/search/api/)). Exa: Lite $4, Auto $7 per 1,000 searches (up to 10 results), contents $1 per 1,000 pages per content type, $10 free credit resetting monthly ([exa.ai/pricing](https://exa.ai/pricing)); 1,500 Lite requests is about $6. Worst case 1,500 `searchExa` (Auto) calls is about $10.5, so lower `EXA_MONTHLY_LIMIT` if you use that tool heavily.
+
+Example systemd drop-in (`~/.config/systemd/user/open-websearch.service.d/api-keys.conf`; not installed by the repo):
+
+```ini
+[Service]
+EnvironmentFile=%h/.config/open-websearch/api-keys.env
+```
+
+with `~/.config/open-websearch/api-keys.env` (chmod 600):
+
+```
+BRAVE_SEARCH_API_KEY=...
+EXA_API_KEY=...
 ```
 
 ## SearXNG rate limiting and MCP client timeouts
